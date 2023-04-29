@@ -6,7 +6,7 @@ This is a port of [Hard Prompts Made Easy](https://github.com/YuxinWenRick/hard-
 
 ## Configuration
 
-Default processing paramaters can be changed by placing `config.json` file to the extension directory.
+Default processing parameters can be changed by placing `config.json` file to the extension directory.
 
 Parameters are the same as on [Hard Prompts Made Easy](https://github.com/YuxinWenRick/hard-prompts-made-easy) page.
 
