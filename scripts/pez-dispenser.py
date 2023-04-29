@@ -125,6 +125,9 @@ def on_progress(step, total):
 
 def inference(model_index, device_name_index, prompt_length, iterations_count, target_images = None, target_prompts = None):
     try :
+        if not state.installed:
+            raise ModuleNotFoundError('Some required packages are not installed. Please restart WebUI to install them automatically.')
+
         device_name = available_devices[device_name_index][0]
 
         model, preprocess = load_model(model_index, device_name)
@@ -229,6 +232,14 @@ def add_tab():
     return [(tab, 'PEZ Dispenser', 'pezdispenser')]
 
 
+def add_tab_not_installed():
+    with gr.Blocks(analytics_enabled = False) as tab:
+        gr.Markdown('# Some required packages are not installed.')
+        gr.Markdown('## Please restart WebUI to install them automatically.')
+
+    return [(tab, 'PEZ Dispenser', 'pezdispenser')]
+
+
 def on_ui_settings():
     pass
     #section = ("pezdispenser", "PEZ Dispenser")
@@ -239,6 +250,10 @@ def on_unload():
     this.reset()
 
 
-script_callbacks.on_ui_tabs(add_tab)
-script_callbacks.on_ui_settings(on_ui_settings)
+if state.installed:
+    script_callbacks.on_ui_tabs(add_tab)
+else:
+    script_callbacks.on_ui_tabs(add_tab_not_installed)
+
+#script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_script_unloaded(on_unload)

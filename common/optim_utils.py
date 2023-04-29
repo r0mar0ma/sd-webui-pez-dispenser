@@ -2,7 +2,29 @@ import time
 import copy
 import open_clip
 import torch
-from sentence_transformers.util import (semantic_search, dot_score, normalize_embeddings)
+
+class State:
+    installed = False
+    interrupted = False
+    time_start = None
+
+    def interrupt(self):
+        self.interrupted = True
+
+    def begin(self):
+        self.interrupted = False
+        self.time_start = time.time()
+
+    def end(self):
+        pass
+
+state = State()
+
+try:
+    from sentence_transformers.util import (semantic_search, dot_score, normalize_embeddings)
+    state.installed = True
+except:
+    print('pez-dispenser error: No sentence_transformers package installed')
 
 
 def nn_project(curr_embeds, embedding_layer, print_hits=False):
@@ -136,22 +158,6 @@ def forward_text_embedding(model, embeddings, ids, image_features, avg_text=Fals
     return logits_per_image, logits_per_text
 
 
-class State:
-    interrupted = False
-    time_start = None
-
-    def interrupt(self):
-        self.interrupted = True
-
-    def begin(self):
-        self.interrupted = False
-        self.time_start = time.time()
-
-    def end(self):
-        pass
-
-state = State()
-
 def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, on_progress, progress_step):
     opt_iters = args.iter
     lr = args.lr
@@ -237,6 +243,9 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
 
 
 def optimize_prompt(model, preprocess, args, device, target_images=None, target_prompts=None, on_progress=None, progress_step=1):
+    if not state.installed:
+        raise ModuleNotFoundError('Some required packages are not installed')
+
     state.begin()
 
     token_embedding = model.token_embedding
@@ -252,4 +261,3 @@ def optimize_prompt(model, preprocess, args, device, target_images=None, target_
     state.end()
 
     return learned_prompt
-    
