@@ -24,7 +24,7 @@ try:
     from sentence_transformers.util import (semantic_search, dot_score, normalize_embeddings)
     state.installed = True
 except:
-    print('pez-dispenser error: No sentence_transformers package installed')
+    print("pez-dispenser error: No sentence_transformers package installed")
 
 
 def nn_project(curr_embeds, embedding_layer, print_hits=False):
@@ -70,7 +70,7 @@ def decode_ids(input_ids, tokenizer, by_token=False):
             for tmp in input_ids_i:
                 curr_text.append(tokenizer.decode([tmp]))
 
-            texts.append('|'.join(curr_text))
+            texts.append("|".join(curr_text))
     else:
         for input_ids_i in input_ids:
             texts.append(tokenizer.decode(input_ids_i))
@@ -244,7 +244,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
 
 def optimize_prompt(model, preprocess, args, device, target_images=None, target_prompts=None, on_progress=None, progress_step=1):
     if not state.installed:
-        raise ModuleNotFoundError('Some required packages are not installed')
+        raise ModuleNotFoundError("Some required packages are not installed")
 
     state.begin()
 
