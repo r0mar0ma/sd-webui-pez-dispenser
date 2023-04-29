@@ -2,4 +2,4 @@
 
 This is a port of [Hard Prompts Made Easy](https://github.com/YuxinWenRick/hard-prompts-made-easy) / [PEZ Dispenser](https://huggingface.co/spaces/tomg-group-umd/pez-dispenser).
 
-![](screenshot.png)
+![](screenshot.jpg)
