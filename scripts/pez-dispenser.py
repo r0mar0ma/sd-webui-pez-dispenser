@@ -179,46 +179,56 @@ def interrupt():
         
 ########## App ##########
 
+def find_prompt(fields):
+    field = [x for x in fields if x[1] == "Prompt"][0][0]
+    return field
+
+def send_prompt(text):
+    print(text)
+    return text
+
 def add_tab():
     with gr.Blocks(analytics_enabled = False) as tab:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
                     with gr.Tab('Image to Prompt'):
-                        input_image = gr.Image(type = 'pil', label = 'Target Image', show_label = False)
-                        process_image_button = gr.Button('Generate Prompt', variant = 'primary')
+                        input_image = gr.Image(type = 'pil', label = 'Target Image', show_label = False, elem_id = 'pezdispenser_input_image')
+                        process_image_button = gr.Button('Generate Prompt', variant = 'primary', elem_id = 'pezdispenser_process_image_button')
 
                     with gr.Tab('Long Prompt to Short Prompt'):
-                        input_text = gr.Textbox(label = 'Target Prompt', show_label = False, interactive = True, lines = 5)
-                        process_text_button = gr.Button('Distill Prompt', variant = 'primary')
+                        input_text = gr.TextArea(label = 'Target Prompt', show_label = False, interactive = True, elem_id = 'pezdispenser_input_text')
+                        process_text_button = gr.Button('Distill Prompt', variant = 'primary', elem_id = 'pezdispenser_process_text_button')
 
                 with gr.Row():
                     with gr.Column():
-                        opt_model = gr.Dropdown(label = 'Model', choices = [n for n, _, _ in pretrained_models], type = 'index', value = pretrained_models[this.model_index][0])
+                        opt_model = gr.Dropdown(label = 'Model', choices = [n for n, _, _ in pretrained_models], type = 'index', 
+                            value = pretrained_models[this.model_index][0], elem_id = 'pezdispenser_opt_model')
                     with gr.Column():
-                        opt_device = gr.Dropdown(label = 'Process on', choices = [d for _, d in available_devices], type = 'index', value = next((d for n, d in available_devices if n == this.model_device_name), available_devices[0][1]))
+                        opt_device = gr.Dropdown(label = 'Process on', choices = [d for _, d in available_devices], type = 'index', 
+                            value = next((d for n, d in available_devices if n == this.model_device_name), available_devices[0][1]), elem_id = 'pezdispenser_opt_device')
 
                 with gr.Row():
                     with gr.Column():
-                        opt_prompt_length = gr.Slider(label = 'Prompt Length (optimal 8-16)', minimum = 1, maximum = 75, step = 1, value = args.prompt_len)
+                        opt_prompt_length = gr.Slider(label = 'Prompt Length (optimal 8-16)', minimum = 1, maximum = 75, step = 1, value = args.prompt_len, elem_id = 'pezdispenser_opt_prompt_length')
                     with gr.Column():
-                        opt_num_step = gr.Slider(label = 'Optimization Steps (optimal 1000-3000)', minimum = 1, maximum = 10000, step = 1, value = args.iter)
+                        opt_num_step = gr.Slider(label = 'Optimization Steps (optimal 1000-3000)', minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = 'pezdispenser_opt_num_step')
 
             with gr.Column():
-                output_prompt = gr.Textbox(label = 'Prompt', show_label = True, interactive = False)
-                statistics_text = gr.HTML()
-                interrupt_button = gr.Button('Interrupt', variant = 'stop')
+                with gr.Row():
+                    output_prompt = gr.TextArea(label = 'Prompt', show_label = True, interactive = False, elem_id = 'pezdispenser_output_prompt').style(show_copy_button = True)
+                with gr.Row():
+                    with gr.Column():
+                        statistics_text = gr.HTML(elem_id = 'pezdispenser_statistics_text')
+                    with gr.Column():
+                        send_to_txt2img_button = gr.Button('Send to txt2img', elem_id = 'pezdispenser_send_to_txt2img_button')
+                    with gr.Column():
+                        send_to_img2img_button = gr.Button('Send to img2img', elem_id = 'pezdispenser_send_to_img2img_button')
+                with gr.Row():
+                    interrupt_button = gr.Button('Interrupt', variant = 'stop', elem_id = 'pezdispenser_interrupt_button')
 
-        """
         process_image_button.click(
             inference_image,
-            inputs = [input_image, opt_model, opt_device, opt_prompt_length, opt_num_step],
-            outputs = [output_prompt, statistics_text]
-        )
-        """
-        process_image_button.click(
-            inference_image,
-            #_js="inference_image",
             inputs = [input_image, opt_model, opt_device, opt_prompt_length, opt_num_step],
             outputs = [output_prompt, statistics_text]
         )
@@ -228,6 +238,20 @@ def add_tab():
             outputs = [output_prompt, statistics_text]
         )
         interrupt_button.click(interrupt)
+        
+        send_to_txt2img_button.click(
+            lambda x: x,
+            _js = 'pezdispenser_switch_to_txt2img',
+            inputs = [output_prompt],
+            outputs = [find_prompt(ui.txt2img_paste_fields)]
+        )
+
+        send_to_img2img_button.click(
+            fn = send_prompt,
+            _js = 'pezdispenser_switch_to_img2img',
+            inputs = [output_prompt],
+            outputs = [find_prompt(ui.img2img_paste_fields)]
+        )
 
     return [(tab, 'PEZ Dispenser', 'pezdispenser')]
 
