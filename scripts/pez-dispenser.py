@@ -9,6 +9,8 @@ import gradio as gr
 from common.optim_utils import optimize_prompt, state
 from modules import devices, scripts, script_callbacks, ui, shared, progress
 
+ALLOW_DEVICE_SELECTION = False
+
 class ThisState:
 
     def __init__(self):
@@ -72,14 +74,16 @@ available_devices = []
 def append_available_device(device_name, prefix = ""):
     available_devices.append((device_name, prefix + get_device_display_name(device_name)))
 
-append_available_device(devices.get_optimal_device_name(), prefix = "(Default) ")
-if torch.cuda.is_available():
-    append_available_device("cpu")
-    for i in range(torch.cuda.device_count()):
-        append_available_device(f"cuda:{i}")
+if ALLOW_DEVICE_SELECTION:
+    append_available_device(devices.get_optimal_device_name(), prefix = "(Default) ")
 
-if not args.device is None and args.device in [n for n, _ in available_devices]:
-    this.model_device_name = args.device
+    if torch.cuda.is_available():
+        append_available_device("cpu")
+        for i in range(torch.cuda.device_count()):
+            append_available_device(f"cuda:{i}")
+
+    if not args.device is None and args.device in [n for n, _ in available_devices]:
+        this.model_device_name = args.device
 
 ########## Models ##########
 
@@ -98,6 +102,7 @@ for i in range(len(pretrained_models)):
 def load_model(index, device_name):
     if this.model is None or this.preprocess is None or this.model_index != index or this.model_device_name != device_name:
         _, clip_model, clip_pretrain = pretrained_models[index];
+
         print(f"Loading model: {clip_model}:{clip_pretrain}, device: {get_device_display_name(device_name)}")
 
         model, _, preprocess = open_clip.create_model_and_transforms(clip_model, pretrained = clip_pretrain, device = torch.device(device_name))
@@ -141,7 +146,7 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
         if target_image is None and target_prompt is None:
             raise ValueError("Nothing to process")
 
-        device_name = available_devices[device_name_index][0]
+        device_name = available_devices[device_name_index][0] if ALLOW_DEVICE_SELECTION else this.model_device_name
 
         shared.state.textinfo = "Loading model..."
         model, preprocess = load_model(model_index, device_name)
@@ -240,9 +245,24 @@ def add_tab():
                     with gr.Column():
                         opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index", 
                             value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_opt_model")
-                    with gr.Column():
-                        opt_device = gr.Dropdown(label = "Process on", choices = [d for _, d in available_devices], type = "index", 
-                            value = next((d for n, d in available_devices if n == this.model_device_name), available_devices[0][1]), elem_id = "pezdispenser_opt_device")
+                    if ALLOW_DEVICE_SELECTION:
+                        with gr.Column():
+                            opt_device = gr.Dropdown(
+                                label = "Process on", 
+                                choices = [d for _, d in available_devices] if ALLOW_DEVICE_SELECTION else ["Default"], 
+                                type = "index", 
+                                value = next((d for n, d in available_devices if n == this.model_device_name), available_devices[0][1]) if ALLOW_DEVICE_SELECTION else ["Default"], 
+                                elem_id = "pezdispenser_opt_device", 
+                                visible = ALLOW_DEVICE_SELECTION
+                            )
+                    else:
+                        opt_device = gr.Dropdown(
+                            choices = ["Default"], 
+                            type = "index", 
+                            value = ["Default"], 
+                            elem_id = "pezdispenser_opt_device", 
+                            visible = False
+                        )
 
                 with gr.Row():
                     with gr.Column():
