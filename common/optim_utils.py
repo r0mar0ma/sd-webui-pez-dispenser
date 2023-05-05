@@ -2,21 +2,10 @@ import time
 import copy
 import open_clip
 import torch
+from modules import shared
 
 class State:
     installed = False
-    interrupted = False
-    time_start = None
-
-    def interrupt(self):
-        self.interrupted = True
-
-    def begin(self):
-        self.interrupted = False
-        self.time_start = time.time()
-
-    def end(self):
-        pass
 
 state = State()
 
@@ -158,7 +147,7 @@ def forward_text_embedding(model, embeddings, ids, image_features, avg_text=Fals
     return logits_per_image, logits_per_text
 
 
-def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, on_progress, progress_step):
+def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, on_progress, progress_steps, progress_args):
     opt_iters = args.iter
     lr = args.lr
     weight_decay = args.weight_decay
@@ -176,10 +165,13 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
     best_text = ""
     
     for step in range(opt_iters):
-        if state.interrupted:
+        if shared.state.interrupted:
             break
-        if (not on_progress is None) and (step % progress_step == 0):
-            on_progress(step, opt_iters)
+        if not on_progress is None:
+            for progress_step in progress_steps:
+                if step % progress_step == 0:
+                    on_progress(step, opt_iters, best_text, progress_args)
+                    break
     
         # randomly sample sample images and get features
         if batch_size is None:
@@ -232,7 +224,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
             best_text = decoded_text
 
     if not on_progress is None:
-        on_progress(step + 1, opt_iters)
+        on_progress(step + 1, opt_iters, best_text, progress_args)
 
     if print_step is not None:
         print()
@@ -242,11 +234,9 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
     return best_text
 
 
-def optimize_prompt(model, preprocess, args, device, target_images=None, target_prompts=None, on_progress=None, progress_step=1):
+def optimize_prompt(model, preprocess, args, device, target_images=None, target_prompts=None, on_progress=None, progress_steps=[1], progress_args=None):
     if not state.installed:
         raise ModuleNotFoundError("Some required packages are not installed")
-
-    state.begin()
 
     token_embedding = model.token_embedding
     tokenizer = open_clip.tokenizer._tokenizer
@@ -256,8 +246,6 @@ def optimize_prompt(model, preprocess, args, device, target_images=None, target_
     all_target_features = get_target_feature(model, preprocess, tokenizer_funct, device, target_images=target_images, target_prompts=target_prompts)
 
     # optimize prompt
-    learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, on_progress, progress_step)
+    learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, on_progress, progress_steps, progress_args)
     
-    state.end()
-
     return learned_prompt
