@@ -339,6 +339,16 @@ def create_tab():
             outputs = [find_prompt(ui.img2img_paste_fields)]
         )
 
+    for obj in [
+        input_image,
+        input_text,
+        opt_model,
+        opt_device,
+        opt_prompt_length,
+        opt_num_step
+    ]:
+        setattr(obj, "do_not_save_to_config", True)
+
     return [(tab, "PEZ Dispenser", "pezdispenser")]
 
 
@@ -474,7 +484,7 @@ class Script(scripts.Script):
             inputs = [input_type]
         )
 
-        return [
+        res = [
             input_type,
             input_image,
             opt_model,
@@ -483,6 +493,10 @@ class Script(scripts.Script):
             opt_sample_step
         ]
 
+        for obj in res:
+            setattr(obj, "do_not_save_to_config", True)
+
+        return res
 
     def run(self, p,
         input_type,
