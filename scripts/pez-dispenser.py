@@ -54,7 +54,7 @@ args.__dict__.update(json.loads("""
 }
 """))
 if os.path.isfile(config_file_path):
-    with open(config_file_path) as f:
+    with open(config_file_path, encoding='utf-8') as f:
         args.__dict__.update(json.load(f))
 args.print_step = None
 
