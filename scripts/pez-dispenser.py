@@ -10,8 +10,12 @@ import gradio as gr
 import common.optim_utils as utils
 from modules import devices, scripts, script_callbacks, ui, shared, progress, extra_networks
 from modules.processing import process_images, Processed
+from modules.ui_components import ToolButton
 
 ALLOW_DEVICE_SELECTION = False
+
+unload_symbol = '\u274c' # delete
+#unload_symbol = '\u267b' # recycle
 
 class ThisState:
 
@@ -113,18 +117,56 @@ for i in range(len(pretrained_models)):
         this.model_index = i
         break
 
+def unload_model():
+    if this.model is None and this.preprocess is None:
+        return
+
+    is_cpu = this.model_device_name == "cpu"
+    device = torch.device(this.model_device_name)
+
+    if not is_cpu:
+        memory_used_pre = torch.cuda.memory_allocated(device)
+
+    if not this.model is None:
+        del this.model
+        this.model = None
+    if not this.preprocess is None:
+        del this.preprocess
+        this.preprocess = None
+    
+    if is_cpu:
+        print("Model unloaded")
+    else:
+        memory_freed = memory_used_pre - torch.cuda.memory_allocated(device)
+        print(f"Model unloaded, GPU memory freed: {(memory_freed / 1048576):.2f} MB")
+
+
+
 def load_model(index, device_name):
     if this.model is None or this.preprocess is None or this.model_index != index or this.model_device_name != device_name:
         _, clip_model, clip_pretrain = pretrained_models[index];
 
+        unload_model()
+
         print(f"Loading model: {clip_model}:{clip_pretrain}, device: {get_device_display_name(device_name)}")
 
-        model, _, preprocess = open_clip.create_model_and_transforms(clip_model, pretrained = clip_pretrain, device = torch.device(device_name))
+        is_cpu = device_name == "cpu"
+        device = torch.device(device_name)
+        if not is_cpu:
+            memory_used_pre = torch.cuda.memory_allocated(device)
+
+        model, _, preprocess = open_clip.create_model_and_transforms(clip_model, pretrained = clip_pretrain, device = device)
 
         this.model = model
         this.preprocess = preprocess
         this.model_index = index
         this.model_device_name = device_name
+
+        if is_cpu:
+            print("Model loaded")
+        else:
+            memory_taken = torch.cuda.memory_allocated(device) - memory_used_pre
+            print(f"Model loaded, GPU memory taken: {(memory_taken / 1048576):.2f} MB")
 
     return this.model, this.preprocess
 
@@ -270,8 +312,11 @@ def create_tab():
 
                 with gr.Row():
                     with gr.Column():
-                        opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index",
-                            value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_opt_model")
+                        with gr.Row():
+                            opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index",
+                                value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_opt_model")
+                            unload_model_button = ToolButton(unload_symbol, elem_id = "pezdispenser_unload_model_button")
+
                     if ALLOW_DEVICE_SELECTION:
                         with gr.Column():
                             opt_device = gr.Dropdown(
@@ -310,6 +355,10 @@ def create_tab():
                             send_to_img2img_button = gr.Button("Send to img2img", elem_id = "pezdispenser_send_to_img2img_button")
                     with gr.Row():
                         interrupt_button = gr.Button("Interrupt", variant = "stop", elem_id = "pezdispenser_interrupt_button", visible = False)
+
+        unload_model_button.click(
+            unload_model
+        )
 
         process_image_button.click(
             ui.wrap_queued_call(inference_image),
@@ -466,8 +515,10 @@ class Script(scripts.Script):
         gr.HTML('<br />')
         with gr.Row():
             with gr.Column():
-                opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index",
-                    value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_script_opt_model")
+                with gr.Row():
+                    opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index",
+                        value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_script_opt_model")
+                    unload_model_button = ToolButton(unload_symbol, elem_id = "pezdispenser_script_unload_model_button")
 
         gr.HTML('<br />')
         with gr.Row():
@@ -482,6 +533,10 @@ class Script(scripts.Script):
             fn = None,
             _js = "pezdispenser_show_script_image",
             inputs = [input_type]
+        )
+
+        unload_model_button.click(
+            unload_model
         )
 
         res = [
