@@ -7,10 +7,269 @@ import traceback
 import torch
 import open_clip
 import gradio as gr
-import common.optim_utils as utils
+#import common.optim_utils as utils
 from modules import devices, scripts, script_callbacks, ui, shared, progress, extra_networks
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
+
+VERSION = "1.1.0"
+
+#################################
+########## optim_utils ##########
+#################################
+
+#import time
+#import copy
+#import open_clip
+#import torch
+#from modules import shared
+
+class State:
+    installed = False
+
+state = State()
+
+try:
+    from sentence_transformers.util import (semantic_search, dot_score, normalize_embeddings)
+    state.installed = True
+except:
+    print("pez-dispenser error: No sentence_transformers package installed")
+
+
+def nn_project(curr_embeds, embedding_layer, print_hits=False):
+    with torch.no_grad():
+        bsz,seq_len,emb_dim = curr_embeds.shape
+        
+        # Using the sentence transformers semantic search which is 
+        # a dot product exact kNN search between a set of 
+        # query vectors and a corpus of vectors
+        curr_embeds = curr_embeds.reshape((-1,emb_dim))
+        curr_embeds = normalize_embeddings(curr_embeds) # queries
+
+        embedding_matrix = embedding_layer.weight
+        embedding_matrix = normalize_embeddings(embedding_matrix)
+        
+        hits = semantic_search(curr_embeds, embedding_matrix, 
+                                query_chunk_size=curr_embeds.shape[0], 
+                                top_k=1,
+                                score_function=dot_score)
+
+        if print_hits:
+            all_hits = []
+            for hit in hits:
+                all_hits.append(hit[0]["score"])
+            print(f"mean hits:{mean(all_hits)}")
+        
+        nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
+        nn_indices = nn_indices.reshape((bsz,seq_len))
+
+        projected_embeds = embedding_layer(nn_indices)
+
+    return projected_embeds, nn_indices
+
+
+def decode_ids(input_ids, tokenizer, by_token=False):
+    input_ids = input_ids.detach().cpu().numpy()
+
+    texts = []
+
+    if by_token:
+        for input_ids_i in input_ids:
+            curr_text = []
+            for tmp in input_ids_i:
+                curr_text.append(tokenizer.decode([tmp]))
+
+            texts.append("|".join(curr_text))
+    else:
+        for input_ids_i in input_ids:
+            texts.append(tokenizer.decode(input_ids_i))
+
+    return texts
+
+
+def get_target_feature(model, preprocess, tokenizer_funct, device, target_images=None, target_prompts=None):
+    if target_images is not None:
+        with torch.no_grad():
+            curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
+            curr_images = torch.concatenate(curr_images).to(device)
+            all_target_features = model.encode_image(curr_images)
+    else:
+        texts = tokenizer_funct(target_prompts).to(device)
+        all_target_features = model.encode_text(texts)
+
+    return all_target_features
+
+
+def initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs):
+
+    # randomly optimize prompt embeddings
+    prompt_ids = torch.randint(len(tokenizer.encoder), (prompt_bs, prompt_len)).to(device)
+    prompt_embeds = token_embedding(prompt_ids).detach()
+    prompt_embeds.requires_grad = True
+
+    # initialize the template
+    template_text = "{}"
+    padded_template_text = template_text.format(" ".join(["<start_of_text>"] * prompt_len))
+    dummy_ids = tokenizer.encode(padded_template_text)
+
+    # -1 for optimized tokens
+    dummy_ids = [i if i != 49406 else -1 for i in dummy_ids]
+    dummy_ids = [49406] + dummy_ids + [49407]
+    dummy_ids += [0] * (77 - len(dummy_ids))
+    dummy_ids = torch.tensor([dummy_ids] * prompt_bs).to(device)
+
+    # for getting dummy embeds; -1 won't work for token_embedding
+    tmp_dummy_ids = copy.deepcopy(dummy_ids)
+    tmp_dummy_ids[tmp_dummy_ids == -1] = 0
+    dummy_embeds = token_embedding(tmp_dummy_ids).detach()
+    dummy_embeds.requires_grad = False
+    
+    return prompt_embeds, dummy_embeds, dummy_ids
+
+
+def encode_text_embedding(model, text_embedding, ids, avg_text=False):
+    cast_dtype = model.transformer.get_cast_dtype()
+
+    x = text_embedding + model.positional_embedding.to(cast_dtype)
+    x = x.permute(1, 0, 2)  # NLD -> LND
+    x = model.transformer(x, attn_mask=model.attn_mask)
+    x = x.permute(1, 0, 2)  # LND -> NLD
+    x = model.ln_final(x)
+
+    # x.shape = [batch_size, n_ctx, transformer.width]
+    # take features from the eot embedding (eot_token is the highest number in each sequence)
+    if avg_text:
+        x = x[torch.arange(x.shape[0]), :ids.argmax(dim=-1)]
+        x[:, 1:-1]
+        x = x.mean(dim=1) @ model.text_projection
+    else:
+        x = x[torch.arange(x.shape[0]), ids.argmax(dim=-1)] @ model.text_projection
+
+    return x
+    
+def forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
+    text_features = encode_text_embedding(model, embeddings, ids, avg_text=avg_text)
+
+    if return_feature:
+        return text_features
+
+    # normalized features
+    image_features = image_features / image_features.norm(dim=1, keepdim=True)
+    text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+    # cosine similarity as logits
+    # logit_scale = model.logit_scale.exp()
+    logits_per_image = image_features @ text_features.t()
+    logits_per_text = logits_per_image.t()
+
+    # shape = [global_batch_size, global_batch_size]
+    return logits_per_image, logits_per_text
+
+
+def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, device, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, on_progress, progress_steps, progress_args):
+    # initialize prompt
+    prompt_embeds, dummy_embeds, dummy_ids = initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs)
+    p_bs, p_len, p_dim = prompt_embeds.shape
+
+    # get optimizer
+    input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
+
+    best_sim = 0
+    best_text = ""
+    
+    for step in range(opt_iters):
+        if shared.state.interrupted:
+            break
+        if not on_progress is None:
+            for progress_step in progress_steps:
+                if step % progress_step == 0:
+                    on_progress(step, opt_iters, best_text, progress_args)
+                    break
+    
+        # randomly sample sample images and get features
+        if batch_size is None:
+            target_features = all_target_features
+        else:
+            curr_indx = torch.randperm(len(all_target_features))
+            target_features = all_target_features[curr_indx][0:batch_size]
+            
+        universal_target_features = all_target_features
+        
+        # forward projection
+        projected_embeds, nn_indices = nn_project(prompt_embeds, token_embedding, print_hits=False)
+
+        # get cosine similarity score with all target features
+        with torch.no_grad():
+            padded_embeds = dummy_embeds.detach().clone()
+            padded_embeds[dummy_ids == -1] = projected_embeds.reshape(-1, p_dim)
+            logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, universal_target_features)
+            scores_per_prompt = logits_per_image.mean(dim=0)
+            universal_cosim_score = scores_per_prompt.max().item()
+            best_indx = scores_per_prompt.argmax().item()
+        
+        tmp_embeds = prompt_embeds.detach().clone()
+        tmp_embeds.data = projected_embeds.data
+        tmp_embeds.requires_grad = True
+        
+        # padding
+        padded_embeds = dummy_embeds.detach().clone()
+        padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
+        
+        logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, target_features)
+        cosim_scores = logits_per_image
+        loss = 1 - cosim_scores.mean()
+        
+        prompt_embeds.grad, = torch.autograd.grad(loss, [tmp_embeds])
+        
+        input_optimizer.step()
+        input_optimizer.zero_grad()
+
+        curr_lr = input_optimizer.param_groups[0]["lr"]
+        cosim_scores = cosim_scores.mean().item()
+
+        decoded_text = decode_ids(nn_indices, tokenizer)[best_indx]
+        if print_step is not None and (step % print_step == 0 or step == opt_iters-1):
+            print(f"step: {step}, lr: {curr_lr}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}")
+        
+        if best_sim < universal_cosim_score:
+            best_sim = universal_cosim_score
+            
+            best_text = decoded_text
+
+    if not on_progress is None:
+        on_progress(step + 1, opt_iters, best_text, progress_args)
+
+    if print_step is not None:
+        print()
+        print(f"best cosine sim: {best_sim}")
+        print(f"best prompt: {best_text}")
+
+    return best_text
+
+
+def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, target_images=None, target_prompts=None, on_progress=None, progress_steps=[1], progress_args=None):
+    if not state.installed:
+        raise ModuleNotFoundError("Some required packages are not installed")
+
+    token_embedding = model.token_embedding
+    tokenizer = open_clip.tokenizer._tokenizer
+    tokenizer_funct = open_clip.get_tokenizer(clip_model)
+
+    # get target features
+    all_target_features = get_target_feature(model, preprocess, tokenizer_funct, device, target_images=target_images, target_prompts=target_prompts)
+
+    # optimize prompt
+    learned_prompt = optimize_prompt_loop(
+        model, tokenizer, token_embedding, all_target_features, device,
+        prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size,
+        on_progress, progress_steps, progress_args
+    )
+    
+    return learned_prompt
+
+################################
+########## optim_utils ##########
+#################################
 
 ALLOW_DEVICE_SELECTION = False
 
@@ -31,6 +290,7 @@ class ThisState:
         self.model_device_name = devices.get_optimal_device_name()
         self.model = None
         self.preprocess = None
+        self.clip_model = None
         self.progress_title = ""
         self.progress_started = time.time()
 
@@ -42,6 +302,7 @@ config_dir = scripts.basedir()
 config_file_path = os.path.join(config_dir, "config.json")
 
 args = argparse.Namespace()
+# default args from hard-prompts-made-easy
 args.__dict__.update(json.loads("""
 {
     "prompt_len": 8,
@@ -60,7 +321,6 @@ args.__dict__.update(json.loads("""
 if os.path.isfile(config_file_path):
     with open(config_file_path, encoding='utf-8') as f:
         args.__dict__.update(json.load(f))
-args.print_step = None
 
 def show_tab():
     try:
@@ -159,6 +419,7 @@ def load_model(index, device_name):
 
         this.model = model
         this.preprocess = preprocess
+        this.clip_model = clip_model
         this.model_index = index
         this.model_device_name = device_name
 
@@ -168,7 +429,7 @@ def load_model(index, device_name):
             memory_taken = torch.cuda.memory_allocated(device) - memory_used_pre
             print(f"Model loaded, GPU memory taken: {(memory_taken / 1048576):.2f} MB")
 
-    return this.model, this.preprocess
+    return this.model, this.preprocess, this.clip_model
 
 ########## Processing ##########
 
@@ -198,7 +459,7 @@ def on_progress(step, total, prompt, progress_args):
     shared.state.job_no = step - 1
     shared.state.nextjob()
 
-def inference(task_id, model_index, device_name_index, prompt_length, iterations_count, target_image = None, target_prompt = None):
+def inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_image = None, target_prompt = None):
     progress.add_task_to_queue(task_id)
     shared.state.begin()
     progress.start_task(task_id)
@@ -208,7 +469,7 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
     res = "", ""
 
     try:
-        if not utils.state.installed:
+        if not state.installed:
             raise ModuleNotFoundError("Some required packages are not installed. Please restart WebUI to install them automatically.")
 
         parsed_prompt, parsed_extra_networks = parse_prompt(target_prompt)
@@ -219,22 +480,29 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
         device_name = available_devices[device_name_index][0] if ALLOW_DEVICE_SELECTION else this.model_device_name
 
         shared.state.textinfo = "Loading model..."
-        model, preprocess = load_model(model_index, device_name)
+        model, preprocess, clip_model = load_model(model_index, device_name)
 
-        args.prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
-        args.iter = int(iterations_count) if iterations_count is not None else 1000
+        prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
+        iter = int(iterations_count) if iterations_count is not None else 1000
 
         shared.state.textinfo = "Processing..."
 
-        prompt = utils.optimize_prompt(
+        prompt = optimize_prompt(
             model,
             preprocess,
-            args,
             torch.device(device_name),
+            clip_model,
+            prompt_len,
+            iter,
+            float(lr),
+            float(weight_decay),
+            int(prompt_bs),
+            None,
+            int(batch_size),
             target_images = [ target_image ] if not target_image is None else None,
             target_prompts = [ parsed_prompt ] if not parsed_prompt is None else None,
             on_progress = on_progress,
-            progress_steps = [ max(args.iter // 100, 10) ]
+            progress_steps = [ max(iter // 100, 10) ]
         )
 
         print("")
@@ -255,13 +523,13 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
 
     return res
 
-def inference_image(task_id, target_image, model_index, device_name_index, prompt_length, iterations_count):
+def inference_image(task_id, target_image, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size):
     this.start_progress("Processing image")
-    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, target_image = target_image)
+    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_image = target_image)
 
-def inference_text(task_id, target_prompt, model_index, device_name_index, prompt_length, iterations_count):
+def inference_text(task_id, target_prompt, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size):
     this.start_progress("Processing prompt")
-    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, target_prompt = target_prompt if not target_prompt is None and target_prompt != "" else None)
+    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_prompt = target_prompt if not target_prompt is None and target_prompt != "" else None)
 
 def interrupt():
     shared.state.interrupt()
@@ -305,10 +573,12 @@ def create_tab():
                     with gr.Tab("Image to prompt"):
                         input_image = gr.Image(type = "pil", label = "Target image", show_label = False, elem_id = "pezdispenser_input_image")
                         process_image_button = gr.Button("Generate prompt", variant = "primary", elem_id = "pezdispenser_process_image_button")
+                        setattr(process_image_button, "do_not_save_to_config", True)
 
                     with gr.Tab("Long prompt to short prompt"):
                         input_text = gr.TextArea(label = "Target prompt", show_label = False, interactive = True, elem_id = "pezdispenser_input_text")
                         process_text_button = gr.Button("Distill prompt", variant = "primary", elem_id = "pezdispenser_process_text_button")
+                        setattr(process_text_button, "do_not_save_to_config", True)
 
                 with gr.Row():
                     with gr.Column():
@@ -316,6 +586,7 @@ def create_tab():
                             opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index",
                                 value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_opt_model")
                             unload_model_button = ToolButton(unload_symbol, elem_id = "pezdispenser_unload_model_button")
+                            setattr(unload_model_button, "do_not_save_to_config", True)
 
                     if ALLOW_DEVICE_SELECTION:
                         with gr.Column():
@@ -342,6 +613,19 @@ def create_tab():
                     with gr.Column():
                         opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = "pezdispenser_opt_num_step")
 
+                with gr.Row():
+                    with gr.Accordion("Advanced", open = False):
+                        with gr.Row():
+                            with gr.Column():
+                                opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_lr")
+                                opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_weight_decay")
+                            with gr.Column():
+                                opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_bs")
+                                opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_batch_size")
+
+                with gr.Row():
+                    gr.HTML(f"Version {VERSION}")
+            
             with gr.Column():
                 with gr.Group(elem_id = "pezdispenser_results_column"):
                     with gr.Row():
@@ -351,8 +635,10 @@ def create_tab():
                             statistics_text = gr.HTML(elem_id = "pezdispenser_statistics_text")
                         with gr.Column():
                             send_to_txt2img_button = gr.Button("Send to txt2img", elem_id = "pezdispenser_send_to_txt2img_button")
+                            setattr(send_to_txt2img_button, "do_not_save_to_config", True)
                         with gr.Column():
                             send_to_img2img_button = gr.Button("Send to img2img", elem_id = "pezdispenser_send_to_img2img_button")
+                            setattr(send_to_img2img_button, "do_not_save_to_config", True)
                     with gr.Row():
                         interrupt_button = gr.Button("Interrupt", variant = "stop", elem_id = "pezdispenser_interrupt_button", visible = False)
 
@@ -363,13 +649,13 @@ def create_tab():
         process_image_button.click(
             ui.wrap_queued_call(inference_image),
             _js = "pezdispenser_submit",
-            inputs = [input_text, input_image, opt_model, opt_device, opt_prompt_length, opt_num_step],
+            inputs = [input_text, input_image, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size],
             outputs = [output_prompt, statistics_text]
         )
         process_text_button.click(
             inference_text,
             _js = "pezdispenser_submit",
-            inputs = [input_text, input_text, opt_model, opt_device, opt_prompt_length, opt_num_step],
+            inputs = [input_text, input_text, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size],
             outputs = [output_prompt, statistics_text]
         )
         interrupt_button.click(interrupt)
@@ -394,7 +680,11 @@ def create_tab():
         opt_model,
         opt_device,
         opt_prompt_length,
-        opt_num_step
+        opt_num_step,
+        opt_lr,
+        opt_weight_decay,
+        opt_prompt_bs,
+        opt_batch_size
     ]:
         setattr(obj, "do_not_save_to_config", True)
 
@@ -425,7 +715,7 @@ def on_unload():
 
 
 if show_tab():
-    if utils.state.installed:
+    if state.installed:
         script_callbacks.on_ui_tabs(create_tab)
     else:
         script_callbacks.on_ui_tabs(create_tab_not_installed)
@@ -493,14 +783,14 @@ class Script(scripts.Script):
     def show(self, is_img2img):
         if not show_script():
             return False
-        if not utils.state.installed:
+        if not state.installed:
             return False
         return not is_img2img
 
     def ui(self, is_img2img):
         if not show_script():
             return []
-        if not utils.state.installed:
+        if not state.installed:
             return []
         if is_img2img:
             return []
@@ -519,6 +809,7 @@ class Script(scripts.Script):
                     opt_model = gr.Dropdown(label = "Model", choices = [n for n, _, _ in pretrained_models], type = "index",
                         value = pretrained_models[this.model_index][0], elem_id = "pezdispenser_script_opt_model")
                     unload_model_button = ToolButton(unload_symbol, elem_id = "pezdispenser_script_unload_model_button")
+                    setattr(unload_model_button, "do_not_save_to_config", True)
 
         gr.HTML('<br />')
         with gr.Row():
@@ -528,6 +819,19 @@ class Script(scripts.Script):
                 opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = "pezdispenser_script_opt_num_step")
             with gr.Column():
                 opt_sample_step = gr.Slider(label = "Sample on every step (0 - disabled)", minimum = 0, maximum = 10000, step = 1, value = 0, elem_id = "pezdispenser_script_opt_sample_step")
+
+        with gr.Row():
+            with gr.Accordion("Advanced", open = False):
+                with gr.Row():
+                    with gr.Column():
+                        opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_lr")
+                        opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_weight_decay")
+                    with gr.Column():
+                        opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_prompt_bs")
+                        opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_prompt_batch_size")
+
+        with gr.Row():
+            gr.HTML(f"<br/>Version {VERSION}")
 
         input_type.change(
             fn = None,
@@ -545,7 +849,11 @@ class Script(scripts.Script):
             opt_model,
             opt_prompt_length,
             opt_num_step,
-            opt_sample_step
+            opt_sample_step,
+            opt_lr,
+            opt_weight_decay,
+            opt_prompt_bs,
+            opt_batch_size
         ]
 
         for obj in res:
@@ -559,14 +867,18 @@ class Script(scripts.Script):
         model_index,
         prompt_length,
         iterations_count,
-        sample_every_iteration
+        sample_every_iteration,
+        lr,
+        weight_decay,
+        prompt_bs,
+        batch_size
     ):
         if not show_script():
             return Processed(p, [])
 
         script_name = os.path.splitext(os.path.basename(self.filename))[0]
 
-        if not utils.state.installed:
+        if not state.installed:
             raise ModuleNotFoundError("Some required packages are not installed")
 
         is_image = input_type == "Image to prompt"
@@ -580,17 +892,14 @@ class Script(scripts.Script):
                 raise RuntimeError("Prompt is empty")
                 
         iterations_count_norm = int(iterations_count) if iterations_count is not None else 1000
+        prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
 
         shared.state.job_count = p.n_iter
-
-        argsc = copy.deepcopy(args)
-        argsc.prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
-        argsc.iter = iterations_count_norm
 
         saved_textinfo = shared.state.textinfo
         shared.state.textinfo = "Loading model..."
         device_name = devices.get_optimal_device_name()
-        model, preprocess = load_model(model_index, device_name)
+        model, preprocess, clip_model = load_model(model_index, device_name)
         shared.state.textinfo = saved_textinfo
 
         run_handler = ScriptRunHandler(p, parsed_extra_networks)
@@ -609,11 +918,18 @@ class Script(scripts.Script):
             saved_textinfo = shared.state.textinfo
             shared.state.textinfo = this.progress_title + "..."
 
-            optimized_prompt = utils.optimize_prompt(
+            optimized_prompt = optimize_prompt(
                 model,
                 preprocess,
-                argsc,
                 torch.device(device_name),
+                clip_model,
+                prompt_len,
+                iterations_count_norm,
+                float(lr),
+                float(weight_decay),
+                int(prompt_bs),
+                None,
+                int(batch_size),
                 target_images = [ input_image ] if is_image else None,
                 target_prompts = None if is_image else [ parsed_prompt ],
                 on_progress = on_script_progress,
