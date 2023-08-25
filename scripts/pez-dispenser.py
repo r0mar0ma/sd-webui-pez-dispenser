@@ -12,7 +12,7 @@ from modules import devices, scripts, script_callbacks, ui, shared, progress, ex
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 #################################
 ########## optim_utils ##########
@@ -390,7 +390,7 @@ for i in range(len(pretrained_models)):
 
 def unload_model():
     if this.model is None and this.preprocess is None:
-        return
+        return "Model was not loaded"
 
     is_cpu = this.model_device_name == "cpu"
     device = torch.device(this.model_device_name)
@@ -406,10 +406,13 @@ def unload_model():
         this.preprocess = None
     
     if is_cpu:
-        print("Model unloaded")
+        msg = "Model unloaded"
     else:
         memory_freed = memory_used_pre - torch.cuda.memory_allocated(device)
-        print(f"Model unloaded, GPU memory freed: {(memory_freed / 1048576):.2f} MB")
+        msg = f"Model unloaded, GPU memory freed: {(memory_freed / 1048576):.2f} MB"
+
+    print(msg)
+    return msg
 
 
 
@@ -664,7 +667,8 @@ def create_tab():
                         interrupt_button = gr.Button("Interrupt", variant = "stop", elem_id = "pezdispenser_interrupt_button", visible = False)
 
         unload_model_button.click(
-            unload_model
+            unload_model,
+            outputs = [ statistics_text ]
         )
 
         process_image_button.click(

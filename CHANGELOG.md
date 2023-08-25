@@ -1,3 +1,9 @@
+## 1.2.1
+
+### Bug Fixes:
+ * Unload model small fix
+
+
 ## 1.2.0
 
 ### Features:
