@@ -25,6 +25,6 @@ function pezdispenser_submit() {
     return res
 }
 
-function pezdispenser_show_script_image(type) {
-    gradioApp().getElementById("pezdispenser_script_input_image").style.display = (type == "Image to prompt") ? "block" : "none"
+function pezdispenser_show_script_images(type) {
+    gradioApp().getElementById("pezdispenser_script_input_images_group").style.display = (type == "Image to prompt") ? "block" : "none"
 }

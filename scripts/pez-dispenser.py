@@ -12,7 +12,7 @@ from modules import devices, scripts, script_callbacks, ui, shared, progress, ex
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 #################################
 ########## optim_utils ##########
@@ -87,15 +87,18 @@ def decode_ids(input_ids, tokenizer, by_token=False):
     return texts
 
 
-def get_target_feature(model, preprocess, tokenizer_funct, device, target_images=None, target_prompts=None):
-    if target_images is not None:
-        with torch.no_grad():
-            curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
-            curr_images = torch.concatenate(curr_images).to(device)
-            all_target_features = model.encode_image(curr_images)
-    else:
-        texts = tokenizer_funct(target_prompts).to(device)
-        all_target_features = model.encode_text(texts)
+def get_target_feature_images(model, preprocess, device, target_images):
+    with torch.no_grad():
+        curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
+        curr_images = torch.concatenate(curr_images).to(device)
+        all_target_features = model.encode_image(curr_images)
+
+    return all_target_features
+
+
+def get_target_feature_prompts(model, tokenizer_funct, device, target_prompts):
+    texts = tokenizer_funct(target_prompts).to(device)
+    all_target_features = model.encode_text(texts)
 
     return all_target_features
 
@@ -253,11 +256,16 @@ def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters
 
     token_embedding = model.token_embedding
     tokenizer = open_clip.tokenizer._tokenizer
-    tokenizer_funct = open_clip.get_tokenizer(clip_model)
 
     # get target features
-    all_target_features = get_target_feature(model, preprocess, tokenizer_funct, device, target_images=target_images, target_prompts=target_prompts)
-
+    if not target_images is None:
+        all_target_features = get_target_feature_images(model, preprocess, device, target_images)
+    elif not target_prompts is None:
+        tokenizer_funct = open_clip.get_tokenizer(clip_model)
+        all_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts)
+    else:
+        raise ValueError("No input images or prompts")
+    
     # optimize prompt
     learned_prompt = optimize_prompt_loop(
         model, tokenizer, token_embedding, all_target_features, device,
@@ -272,9 +280,12 @@ def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters
 #################################
 
 ALLOW_DEVICE_SELECTION = False
+INPUT_IMAGES_COUNT = 5
 
 unload_symbol = '\u274c' # delete
 #unload_symbol = '\u267b' # recycle
+
+VERSION_HTML = f'Version <a href="https://github.com/r0mar0ma/sd-webui-pez-dispenser/blob/main/CHANGELOG.md" target="_blank">{VERSION}</a>'
 
 class ThisState:
 
@@ -434,16 +445,20 @@ def load_model(index, device_name):
 ########## Processing ##########
 
 def parse_prompt(prompt):
-    parsed_prompt = None
+    if prompt is None:
+        return None, ""
+
     parsed_extra_networks = ""
-    if not prompt is None:
-        parsed_prompt, extra_network_data = extra_networks.parse_prompt(prompt)
-        for extra_network_name, extra_network_args in extra_network_data.items():
-            for arg in extra_network_args:
-                parsed_extra_networks += f"<{extra_network_name}:{':'.join(arg.items)}>"
-        if parsed_prompt.strip() == "":
-            parsed_prompt = None
-    return parsed_prompt, parsed_extra_networks
+    parsed_prompt, extra_network_data = extra_networks.parse_prompt(prompt)
+    for extra_network_name, extra_network_args in extra_network_data.items():
+        for arg in extra_network_args:
+            parsed_extra_networks += f"<{extra_network_name}:{':'.join(arg.items)}>"
+    
+    parsed_prompts = list(filter(lambda s: len(s) > 0 , [ p.strip() for p in parsed_prompt.split("BREAK") ]))
+    if len(parsed_prompts) == 0:
+        parsed_prompts = None
+    
+    return parsed_prompts, parsed_extra_networks
 
 def on_progress(step, total, prompt, progress_args):
     if step == 0:
@@ -459,7 +474,7 @@ def on_progress(step, total, prompt, progress_args):
     shared.state.job_no = step - 1
     shared.state.nextjob()
 
-def inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_image = None, target_prompt = None):
+def inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_images = None, target_prompt = None):
     progress.add_task_to_queue(task_id)
     shared.state.begin()
     progress.start_task(task_id)
@@ -472,9 +487,10 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
         if not state.installed:
             raise ModuleNotFoundError("Some required packages are not installed. Please restart WebUI to install them automatically.")
 
-        parsed_prompt, parsed_extra_networks = parse_prompt(target_prompt)
+        parsed_prompts, parsed_extra_networks = parse_prompt(target_prompt)
+        parsed_images = list() if target_images is None else list(filter(lambda i: not i is None, target_images))
 
-        if target_image is None and parsed_prompt is None:
+        if len(parsed_images) == 0 and parsed_prompts is None:
             raise ValueError("Nothing to process")
 
         device_name = available_devices[device_name_index][0] if ALLOW_DEVICE_SELECTION else this.model_device_name
@@ -499,8 +515,8 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
             int(prompt_bs),
             None,
             int(batch_size),
-            target_images = [ target_image ] if not target_image is None else None,
-            target_prompts = [ parsed_prompt ] if not parsed_prompt is None else None,
+            target_images = parsed_images if len(parsed_images) > 0 else None,
+            target_prompts = parsed_prompts if not parsed_prompts is None else None,
             on_progress = on_progress,
             progress_steps = [ max(iter // 100, 10) ]
         )
@@ -523,11 +539,11 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
 
     return res
 
-def inference_image(task_id, target_image, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size):
+def inference_image(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, *target_images):
     this.start_progress("Processing image")
-    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_image = target_image)
+    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_images = target_images)
 
-def inference_text(task_id, target_prompt, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size):
+def inference_text(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_prompt):
     this.start_progress("Processing prompt")
     return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_prompt = target_prompt if not target_prompt is None and target_prompt != "" else None)
 
@@ -566,12 +582,17 @@ def find_prompt(fields):
     return field
 
 def create_tab():
+
+    input_images = list()
+
     with gr.Blocks(analytics_enabled = False) as tab:
         with gr.Row():
             with gr.Column():
                 with gr.Row():
                     with gr.Tab("Image to prompt"):
-                        input_image = gr.Image(type = "pil", label = "Target image", show_label = False, elem_id = "pezdispenser_input_image")
+                        for i in range(1, INPUT_IMAGES_COUNT + 1):
+                            with gr.Tab(f"Image {i}"):
+                                input_images.append(gr.Image(type = "pil", label = "Target image", show_label = False, elem_id = f"pezdispenser_input_image_{i}"))
                         process_image_button = gr.Button("Generate prompt", variant = "primary", elem_id = "pezdispenser_process_image_button")
                         setattr(process_image_button, "do_not_save_to_config", True)
 
@@ -624,7 +645,7 @@ def create_tab():
                                 opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_batch_size")
 
                 with gr.Row():
-                    gr.HTML(f"Version {VERSION}")
+                    gr.HTML(VERSION_HTML)
             
             with gr.Column():
                 with gr.Group(elem_id = "pezdispenser_results_column"):
@@ -649,13 +670,13 @@ def create_tab():
         process_image_button.click(
             ui.wrap_queued_call(inference_image),
             _js = "pezdispenser_submit",
-            inputs = [input_text, input_image, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size],
+            inputs = [input_text, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size] + input_images,
             outputs = [output_prompt, statistics_text]
         )
         process_text_button.click(
-            inference_text,
+            ui.wrap_queued_call(inference_text),
             _js = "pezdispenser_submit",
-            inputs = [input_text, input_text, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size],
+            inputs = [input_text, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size, input_text],
             outputs = [output_prompt, statistics_text]
         )
         interrupt_button.click(interrupt)
@@ -675,8 +696,6 @@ def create_tab():
         )
 
     for obj in [
-        input_image,
-        input_text,
         opt_model,
         opt_device,
         opt_prompt_length,
@@ -684,8 +703,9 @@ def create_tab():
         opt_lr,
         opt_weight_decay,
         opt_prompt_bs,
-        opt_batch_size
-    ]:
+        opt_batch_size,
+        input_text
+    ] + input_images:
         setattr(obj, "do_not_save_to_config", True)
 
     return [(tab, "PEZ Dispenser", "pezdispenser")]
@@ -794,13 +814,17 @@ class Script(scripts.Script):
             return []
         if is_img2img:
             return []
+            
+        input_images = list()
 
         gr.HTML('<br />')
         with gr.Row():
             input_type = gr.Radio(label = 'Source', show_label = False,
                 choices = [ "Long prompt to short prompt", "Image to prompt" ], value = "Long prompt to short prompt", elem_id = "pezdispenser_script_input_type")
-        with gr.Row():
-            input_image = gr.Image(type = "pil", label = "Target image", show_label = False, visible = False, elem_id = "pezdispenser_script_input_image")
+        with gr.Row(elem_id = "pezdispenser_script_input_images_group", visible = False):
+            for i in range(1, INPUT_IMAGES_COUNT + 1):
+                with gr.Tab(f"Image {i}"):
+                    input_images.append(gr.Image(type = "pil", label = "Target image", show_label = False, elem_id = f"pezdispenser_script_input_image_{i}"))
 
         gr.HTML('<br />')
         with gr.Row():
@@ -831,11 +855,11 @@ class Script(scripts.Script):
                         opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_prompt_batch_size")
 
         with gr.Row():
-            gr.HTML(f"<br/>Version {VERSION}")
+            gr.HTML(f"<br/>" + VERSION_HTML)
 
         input_type.change(
             fn = None,
-            _js = "pezdispenser_show_script_image",
+            _js = "pezdispenser_show_script_images",
             inputs = [input_type]
         )
 
@@ -845,7 +869,6 @@ class Script(scripts.Script):
 
         res = [
             input_type,
-            input_image,
             opt_model,
             opt_prompt_length,
             opt_num_step,
@@ -854,7 +877,7 @@ class Script(scripts.Script):
             opt_weight_decay,
             opt_prompt_bs,
             opt_batch_size
-        ]
+        ] + input_images
 
         for obj in res:
             setattr(obj, "do_not_save_to_config", True)
@@ -863,7 +886,6 @@ class Script(scripts.Script):
 
     def run(self, p,
         input_type,
-        input_image,
         model_index,
         prompt_length,
         iterations_count,
@@ -871,7 +893,9 @@ class Script(scripts.Script):
         lr,
         weight_decay,
         prompt_bs,
-        batch_size
+        batch_size,
+        
+        *args
     ):
         if not show_script():
             return Processed(p, [])
@@ -880,15 +904,17 @@ class Script(scripts.Script):
 
         if not state.installed:
             raise ModuleNotFoundError("Some required packages are not installed")
+        
+        input_images = list(filter(lambda img: not img is None, args[0:INPUT_IMAGES_COUNT]))
 
         is_image = input_type == "Image to prompt"
-        parsed_prompt, parsed_extra_networks = parse_prompt(None if is_image else p.prompt)
+        parsed_prompts, parsed_extra_networks = parse_prompt(None if is_image else p.prompt)
 
         if is_image:
-            if input_image is None:
+            if len(input_images) == 0:
                 raise ValueError("Input image is empty")
         else:
-            if parsed_prompt is None:
+            if parsed_prompts is None:
                 raise RuntimeError("Prompt is empty")
                 
         iterations_count_norm = int(iterations_count) if iterations_count is not None else 1000
@@ -917,7 +943,7 @@ class Script(scripts.Script):
             this.start_progress("Processing image" if is_image else "Processing prompt")
             saved_textinfo = shared.state.textinfo
             shared.state.textinfo = this.progress_title + "..."
-
+            
             optimized_prompt = optimize_prompt(
                 model,
                 preprocess,
@@ -930,8 +956,8 @@ class Script(scripts.Script):
                 int(prompt_bs),
                 None,
                 int(batch_size),
-                target_images = [ input_image ] if is_image else None,
-                target_prompts = None if is_image else [ parsed_prompt ],
+                target_images = input_images if is_image else None,
+                target_prompts = None if is_image else parsed_prompts,
                 on_progress = on_script_progress,
                 progress_steps = progress_steps,
                 progress_args = run_handler
