@@ -1,3 +1,9 @@
+## 1.2.2
+
+### Features:
+ * Unload model button tooltip
+
+
 ## 1.2.1
 
 ### Bug Fixes:

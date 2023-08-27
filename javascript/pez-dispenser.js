@@ -28,3 +28,13 @@ function pezdispenser_submit() {
 function pezdispenser_show_script_images(type) {
     gradioApp().getElementById("pezdispenser_script_input_images_group").style.display = (type == "Image to prompt") ? "block" : "none"
 }
+
+onUiLoaded(function() {
+    e = gradioApp().querySelector('#pezdispenser_unload_model_button')
+    if (e !== null)
+        e.title = "Unload model"
+
+    e = gradioApp().querySelector('#pezdispenser_script_unload_model_button')
+    if (e !== null)
+        e.title = "Unload model"
+})

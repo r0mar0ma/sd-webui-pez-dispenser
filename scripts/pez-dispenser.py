@@ -12,7 +12,7 @@ from modules import devices, scripts, script_callbacks, ui, shared, progress, ex
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 #################################
 ########## optim_utils ##########
