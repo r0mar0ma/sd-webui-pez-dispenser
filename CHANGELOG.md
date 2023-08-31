@@ -1,3 +1,12 @@
+## 1.2.4
+
+### Features:
+ * Unload model when UI reloads
+
+### Bug Fixes:
+ * Minor UI fixes
+
+
 ## 1.2.3
 
 ### Features:

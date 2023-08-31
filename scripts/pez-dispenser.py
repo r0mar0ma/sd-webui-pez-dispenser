@@ -12,7 +12,7 @@ from modules import devices, scripts, script_callbacks, ui, shared, progress, ex
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 #################################
 ########## optim_utils ##########
@@ -445,6 +445,11 @@ def load_model(index, device_name):
 
     return this.model, this.preprocess, this.clip_model
 
+def on_ui_reload():
+    unload_model()
+
+script_callbacks.on_before_reload(on_ui_reload)
+
 ########## Processing ##########
 
 def parse_prompt(prompt):
@@ -655,12 +660,12 @@ def create_tab():
                     with gr.Row():
                         output_prompt = gr.TextArea(label = "Prompt", show_label = True, interactive = False, show_copy_button = True, elem_id = "pezdispenser_output_prompt")
                     with gr.Row():
-                        with gr.Column():
-                            statistics_text = gr.HTML(elem_id = "pezdispenser_statistics_text")
-                        with gr.Column():
+                        statistics_text = gr.HTML(elem_id = "pezdispenser_statistics_text")
+                    with gr.Row():
+                        with gr.Column(min_width = 50):
                             send_to_txt2img_button = gr.Button("Send to txt2img", elem_id = "pezdispenser_send_to_txt2img_button")
                             setattr(send_to_txt2img_button, "do_not_save_to_config", True)
-                        with gr.Column():
+                        with gr.Column(min_width = 50):
                             send_to_img2img_button = gr.Button("Send to img2img", elem_id = "pezdispenser_send_to_img2img_button")
                             setattr(send_to_img2img_button, "do_not_save_to_config", True)
                     with gr.Row():
