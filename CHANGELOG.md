@@ -1,3 +1,12 @@
+## 1.2.3
+
+### Features:
+ * Added link to Hard Prompts Made Easy documentation
+
+### Bug Fixes:
+ * Minor UI fixes
+
+
 ## 1.2.2
 
 ### Features:

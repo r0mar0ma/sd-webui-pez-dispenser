@@ -12,7 +12,7 @@ from modules import devices, scripts, script_callbacks, ui, shared, progress, ex
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 #################################
 ########## optim_utils ##########
@@ -285,7 +285,7 @@ INPUT_IMAGES_COUNT = 5
 unload_symbol = '\u274c' # delete
 #unload_symbol = '\u267b' # recycle
 
-VERSION_HTML = f'Version <a href="https://github.com/r0mar0ma/sd-webui-pez-dispenser/blob/main/CHANGELOG.md" target="_blank">{VERSION}</a>'
+VERSION_HTML = f'<table width="100%"><tr><td width="50%">Version <a href="https://github.com/r0mar0ma/sd-webui-pez-dispenser/blob/main/CHANGELOG.md" target="_blank">{VERSION}</a></td><td width="50%" style="text-align: end;"><a href="https://arxiv.org/abs/2302.03668" target="_blank">Hard Prompts Made Easy</a> documentation</td></tr></table>'
 
 class ThisState:
 
@@ -653,7 +653,7 @@ def create_tab():
             with gr.Column():
                 with gr.Group(elem_id = "pezdispenser_results_column"):
                     with gr.Row():
-                        output_prompt = gr.TextArea(label = "Prompt", show_label = True, interactive = False, elem_id = "pezdispenser_output_prompt").style(show_copy_button = True)
+                        output_prompt = gr.TextArea(label = "Prompt", show_label = True, interactive = False, show_copy_button = True, elem_id = "pezdispenser_output_prompt")
                     with gr.Row():
                         with gr.Column():
                             statistics_text = gr.HTML(elem_id = "pezdispenser_statistics_text")
@@ -825,7 +825,7 @@ class Script(scripts.Script):
         with gr.Row():
             input_type = gr.Radio(label = 'Source', show_label = False,
                 choices = [ "Long prompt to short prompt", "Image to prompt" ], value = "Long prompt to short prompt", elem_id = "pezdispenser_script_input_type")
-        with gr.Row(elem_id = "pezdispenser_script_input_images_group", visible = False):
+        with gr.Row(elem_id = "pezdispenser_script_input_images_group", visible = False) as input_images_group:
             for i in range(1, INPUT_IMAGES_COUNT + 1):
                 with gr.Tab(f"Image {i}"):
                     input_images.append(gr.Image(type = "pil", label = "Target image", show_label = False, elem_id = f"pezdispenser_script_input_image_{i}"))
@@ -861,10 +861,14 @@ class Script(scripts.Script):
         with gr.Row():
             gr.HTML(f"<br/>" + VERSION_HTML)
 
+        def input_type_change(t):
+            input_images_group.visible = (t == "Image to prompt")
+            return gr.Row.update(visible = input_images_group.visible)
         input_type.change(
-            fn = None,
-            _js = "pezdispenser_show_script_images",
-            inputs = [input_type]
+            fn = input_type_change,
+            #_js = "pezdispenser_show_script_images",
+            inputs = [input_type],
+            outputs = [input_images_group]
         )
 
         unload_model_button.click(
