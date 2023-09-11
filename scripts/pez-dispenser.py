@@ -12,7 +12,7 @@ from modules import devices, scripts, script_callbacks, ui, shared, progress, ex
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 #################################
 ########## optim_utils ##########
@@ -326,7 +326,8 @@ args.__dict__.update(json.loads("""
     "batch_size": 1,
     "clip_model": "ViT-L-14",
     "clip_pretrain": "openai",
-    "device": null
+    "device": null,
+    "sample_on_iter": 0
 }
 """))
 if os.path.isfile(config_file_path):
@@ -378,7 +379,8 @@ if ALLOW_DEVICE_SELECTION:
 
 pretrained_models = [
     ("SD 1.5 (ViT-L-14, openai)", "ViT-L-14", "openai"),
-    ("SD 2.0, Midjourney (ViT-H-14, laion2b_s32b_b79k)", "ViT-H-14", "laion2b_s32b_b79k")
+    ("SD 2.0, Midjourney (ViT-H-14, laion2b_s32b_b79k)", "ViT-H-14", "laion2b_s32b_b79k"),
+    ("SDXL 1.0 (ViT-bigG-14, laion2b_s39b_b160k)", "ViT-bigG-14", "laion2b_s39b_b160k")
 ]
 for m, p in open_clip.pretrained.list_pretrained(as_str = False):
     pretrained_models.append((f"{m}, {p}", m, p))
@@ -851,7 +853,7 @@ class Script(scripts.Script):
             with gr.Column():
                 opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = "pezdispenser_script_opt_num_step")
             with gr.Column():
-                opt_sample_step = gr.Slider(label = "Sample on every step (0 - disabled)", minimum = 0, maximum = 10000, step = 1, value = 0, elem_id = "pezdispenser_script_opt_sample_step")
+                opt_sample_step = gr.Slider(label = "Sample on every step (0 - disabled)", minimum = 0, maximum = 10000, step = 1, value = args.sample_on_iter, elem_id = "pezdispenser_script_opt_sample_step")
 
         with gr.Row():
             with gr.Accordion("Advanced", open = False):

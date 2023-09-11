@@ -1,3 +1,9 @@
+## 1.2.5
+
+### Features:
+ * Predefined SDXL model
+
+
 ## 1.2.4
 
 ### Features:
