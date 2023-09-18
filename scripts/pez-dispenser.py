@@ -2,282 +2,19 @@ import copy
 import os
 import json
 import time
+import re
 import argparse
 import traceback
 import torch
 import open_clip
 import gradio as gr
-#import common.optim_utils as utils
+import scripts.optim_utils as utils
 from modules import devices, scripts, script_callbacks, ui, shared, progress, extra_networks
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
+from PIL import Image
 
-VERSION = "1.2.5"
-
-#################################
-########## optim_utils ##########
-#################################
-
-#import time
-#import copy
-#import open_clip
-#import torch
-#from modules import shared
-
-class State:
-    installed = False
-
-state = State()
-
-try:
-    from sentence_transformers.util import (semantic_search, dot_score, normalize_embeddings)
-    state.installed = True
-except:
-    print("pez-dispenser error: No sentence_transformers package installed")
-
-
-def nn_project(curr_embeds, embedding_layer, print_hits=False):
-    with torch.no_grad():
-        bsz,seq_len,emb_dim = curr_embeds.shape
-        
-        # Using the sentence transformers semantic search which is 
-        # a dot product exact kNN search between a set of 
-        # query vectors and a corpus of vectors
-        curr_embeds = curr_embeds.reshape((-1,emb_dim))
-        curr_embeds = normalize_embeddings(curr_embeds) # queries
-
-        embedding_matrix = embedding_layer.weight
-        embedding_matrix = normalize_embeddings(embedding_matrix)
-        
-        hits = semantic_search(curr_embeds, embedding_matrix, 
-                                query_chunk_size=curr_embeds.shape[0], 
-                                top_k=1,
-                                score_function=dot_score)
-
-        if print_hits:
-            all_hits = []
-            for hit in hits:
-                all_hits.append(hit[0]["score"])
-            print(f"mean hits:{mean(all_hits)}")
-        
-        nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
-        nn_indices = nn_indices.reshape((bsz,seq_len))
-
-        projected_embeds = embedding_layer(nn_indices)
-
-    return projected_embeds, nn_indices
-
-
-def decode_ids(input_ids, tokenizer, by_token=False):
-    input_ids = input_ids.detach().cpu().numpy()
-
-    texts = []
-
-    if by_token:
-        for input_ids_i in input_ids:
-            curr_text = []
-            for tmp in input_ids_i:
-                curr_text.append(tokenizer.decode([tmp]))
-
-            texts.append("|".join(curr_text))
-    else:
-        for input_ids_i in input_ids:
-            texts.append(tokenizer.decode(input_ids_i))
-
-    return texts
-
-
-def get_target_feature_images(model, preprocess, device, target_images):
-    with torch.no_grad():
-        curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
-        curr_images = torch.concatenate(curr_images).to(device)
-        all_target_features = model.encode_image(curr_images)
-
-    return all_target_features
-
-
-def get_target_feature_prompts(model, tokenizer_funct, device, target_prompts):
-    texts = tokenizer_funct(target_prompts).to(device)
-    all_target_features = model.encode_text(texts)
-
-    return all_target_features
-
-
-def initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs):
-
-    # randomly optimize prompt embeddings
-    prompt_ids = torch.randint(len(tokenizer.encoder), (prompt_bs, prompt_len)).to(device)
-    prompt_embeds = token_embedding(prompt_ids).detach()
-    prompt_embeds.requires_grad = True
-
-    # initialize the template
-    template_text = "{}"
-    padded_template_text = template_text.format(" ".join(["<start_of_text>"] * prompt_len))
-    dummy_ids = tokenizer.encode(padded_template_text)
-
-    # -1 for optimized tokens
-    dummy_ids = [i if i != 49406 else -1 for i in dummy_ids]
-    dummy_ids = [49406] + dummy_ids + [49407]
-    dummy_ids += [0] * (77 - len(dummy_ids))
-    dummy_ids = torch.tensor([dummy_ids] * prompt_bs).to(device)
-
-    # for getting dummy embeds; -1 won't work for token_embedding
-    tmp_dummy_ids = copy.deepcopy(dummy_ids)
-    tmp_dummy_ids[tmp_dummy_ids == -1] = 0
-    dummy_embeds = token_embedding(tmp_dummy_ids).detach()
-    dummy_embeds.requires_grad = False
-    
-    return prompt_embeds, dummy_embeds, dummy_ids
-
-
-def encode_text_embedding(model, text_embedding, ids, avg_text=False):
-    cast_dtype = model.transformer.get_cast_dtype()
-
-    x = text_embedding + model.positional_embedding.to(cast_dtype)
-    x = x.permute(1, 0, 2)  # NLD -> LND
-    x = model.transformer(x, attn_mask=model.attn_mask)
-    x = x.permute(1, 0, 2)  # LND -> NLD
-    x = model.ln_final(x)
-
-    # x.shape = [batch_size, n_ctx, transformer.width]
-    # take features from the eot embedding (eot_token is the highest number in each sequence)
-    if avg_text:
-        x = x[torch.arange(x.shape[0]), :ids.argmax(dim=-1)]
-        x[:, 1:-1]
-        x = x.mean(dim=1) @ model.text_projection
-    else:
-        x = x[torch.arange(x.shape[0]), ids.argmax(dim=-1)] @ model.text_projection
-
-    return x
-    
-def forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
-    text_features = encode_text_embedding(model, embeddings, ids, avg_text=avg_text)
-
-    if return_feature:
-        return text_features
-
-    # normalized features
-    image_features = image_features / image_features.norm(dim=1, keepdim=True)
-    text_features = text_features / text_features.norm(dim=1, keepdim=True)
-
-    # cosine similarity as logits
-    # logit_scale = model.logit_scale.exp()
-    logits_per_image = image_features @ text_features.t()
-    logits_per_text = logits_per_image.t()
-
-    # shape = [global_batch_size, global_batch_size]
-    return logits_per_image, logits_per_text
-
-
-def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, device, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, on_progress, progress_steps, progress_args):
-    # initialize prompt
-    prompt_embeds, dummy_embeds, dummy_ids = initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs)
-    p_bs, p_len, p_dim = prompt_embeds.shape
-
-    # get optimizer
-    input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
-
-    best_sim = 0
-    best_text = ""
-    
-    for step in range(opt_iters):
-        if shared.state.interrupted:
-            break
-        if not on_progress is None:
-            for progress_step in progress_steps:
-                if step % progress_step == 0:
-                    on_progress(step, opt_iters, best_text, progress_args)
-                    break
-    
-        # randomly sample sample images and get features
-        if batch_size is None:
-            target_features = all_target_features
-        else:
-            curr_indx = torch.randperm(len(all_target_features))
-            target_features = all_target_features[curr_indx][0:batch_size]
-            
-        universal_target_features = all_target_features
-        
-        # forward projection
-        projected_embeds, nn_indices = nn_project(prompt_embeds, token_embedding, print_hits=False)
-
-        # get cosine similarity score with all target features
-        with torch.no_grad():
-            padded_embeds = dummy_embeds.detach().clone()
-            padded_embeds[dummy_ids == -1] = projected_embeds.reshape(-1, p_dim)
-            logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, universal_target_features)
-            scores_per_prompt = logits_per_image.mean(dim=0)
-            universal_cosim_score = scores_per_prompt.max().item()
-            best_indx = scores_per_prompt.argmax().item()
-        
-        tmp_embeds = prompt_embeds.detach().clone()
-        tmp_embeds.data = projected_embeds.data
-        tmp_embeds.requires_grad = True
-        
-        # padding
-        padded_embeds = dummy_embeds.detach().clone()
-        padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
-        
-        logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, target_features)
-        cosim_scores = logits_per_image
-        loss = 1 - cosim_scores.mean()
-        
-        prompt_embeds.grad, = torch.autograd.grad(loss, [tmp_embeds])
-        
-        input_optimizer.step()
-        input_optimizer.zero_grad()
-
-        curr_lr = input_optimizer.param_groups[0]["lr"]
-        cosim_scores = cosim_scores.mean().item()
-
-        decoded_text = decode_ids(nn_indices, tokenizer)[best_indx]
-        if print_step is not None and (step % print_step == 0 or step == opt_iters-1):
-            print(f"step: {step}, lr: {curr_lr}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}")
-        
-        if best_sim < universal_cosim_score:
-            best_sim = universal_cosim_score
-            
-            best_text = decoded_text
-
-    if not on_progress is None:
-        on_progress(step + 1, opt_iters, best_text, progress_args)
-
-    if print_step is not None:
-        print()
-        print(f"best cosine sim: {best_sim}")
-        print(f"best prompt: {best_text}")
-
-    return best_text
-
-
-def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, target_images=None, target_prompts=None, on_progress=None, progress_steps=[1], progress_args=None):
-    if not state.installed:
-        raise ModuleNotFoundError("Some required packages are not installed")
-
-    token_embedding = model.token_embedding
-    tokenizer = open_clip.tokenizer._tokenizer
-
-    # get target features
-    if not target_images is None:
-        all_target_features = get_target_feature_images(model, preprocess, device, target_images)
-    elif not target_prompts is None:
-        tokenizer_funct = open_clip.get_tokenizer(clip_model)
-        all_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts)
-    else:
-        raise ValueError("No input images or prompts")
-    
-    # optimize prompt
-    learned_prompt = optimize_prompt_loop(
-        model, tokenizer, token_embedding, all_target_features, device,
-        prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size,
-        on_progress, progress_steps, progress_args
-    )
-    
-    return learned_prompt
-
-################################
-########## optim_utils ##########
-#################################
+VERSION = "1.3.0"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -470,6 +207,11 @@ def parse_prompt(prompt):
     
     return parsed_prompts, parsed_extra_networks
 
+re_normalize_result = re.compile(r"""[()[\]{}<>\\|/~!?@#$%^&*"']""")
+
+def normalize_result(prompt):
+    return re.sub(re_normalize_result, " ", prompt)
+
 def on_progress(step, total, prompt, progress_args):
     if step == 0:
         this.progress_started = time.time()
@@ -494,7 +236,7 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
     res = "", ""
 
     try:
-        if not state.installed:
+        if not utils.state.installed:
             raise ModuleNotFoundError("Some required packages are not installed. Please restart WebUI to install them automatically.")
 
         parsed_prompts, parsed_extra_networks = parse_prompt(target_prompt)
@@ -513,7 +255,7 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
 
         shared.state.textinfo = "Processing..."
 
-        prompt = optimize_prompt(
+        optimized_prompt = utils.optimize_prompt(
             model,
             preprocess,
             torch.device(device_name),
@@ -530,10 +272,11 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
             on_progress = on_progress,
             progress_steps = [ max(iter // 100, 10) ]
         )
+        optimized_prompt = normalize_result(optimized_prompt)
 
         print("")
         processing_time = time.time() - shared.state.time_start
-        res = prompt + parsed_extra_networks, f"Time taken: {processing_time:.2f} sec"
+        res = optimized_prompt + parsed_extra_networks, f"Time taken: {processing_time:.2f} sec"
 
     except Exception as ex:
         print("")
@@ -746,7 +489,7 @@ def on_unload():
 
 
 if show_tab():
-    if state.installed:
+    if utils.state.installed:
         script_callbacks.on_ui_tabs(create_tab)
     else:
         script_callbacks.on_ui_tabs(create_tab_not_installed)
@@ -760,7 +503,7 @@ class ScriptRunHandler:
     def __init__(self, p, parsed_extra_networks):
 
         self.p = p
-        self.parsed_extra_networks = parsed_extra_networks
+        self.parsed_extra_networks = parsed_extra_networks or ""
 
         self.res_images = []
         self.res_all_prompts = []
@@ -775,7 +518,7 @@ class ScriptRunHandler:
 
         pc = copy.copy(self.p)
         pc.n_iter = 1
-        pc.prompt = prompt + self.parsed_extra_networks
+        pc.prompt = normalize_result(prompt) + self.parsed_extra_networks
         pi = process_images(pc)
 
         if shared.state.interrupted or pi.images is None:
@@ -803,6 +546,10 @@ def on_script_progress(step, total, prompt, run_handler):
         run_handler.run(prompt)
 
 
+VALUE_TYPE_PROMPT = "Long prompt to short prompt"
+VALUE_TYPE_IMAGE = "Image to prompt"
+VALUE_TYPE_IMAGES_BATCH = "Batch images to prompt"
+
 class Script(scripts.Script):
 
     def __init__(self, *args, **kwargs):
@@ -814,30 +561,34 @@ class Script(scripts.Script):
     def show(self, is_img2img):
         if not show_script():
             return False
-        if not state.installed:
+        if not utils.state.installed:
             return False
         return not is_img2img
 
     def ui(self, is_img2img):
         if not show_script():
             return []
-        if not state.installed:
+        if not utils.state.installed:
             return []
         if is_img2img:
             return []
             
         input_images = list()
 
-        gr.HTML('<br />')
+        gr.HTML("<br />")
         with gr.Row():
             input_type = gr.Radio(label = 'Source', show_label = False,
-                choices = [ "Long prompt to short prompt", "Image to prompt" ], value = "Long prompt to short prompt", elem_id = "pezdispenser_script_input_type")
+                choices = [ VALUE_TYPE_PROMPT, VALUE_TYPE_IMAGE, VALUE_TYPE_IMAGES_BATCH ], value = VALUE_TYPE_PROMPT, elem_id = "pezdispenser_script_input_type")
+
         with gr.Row(elem_id = "pezdispenser_script_input_images_group", visible = False) as input_images_group:
             for i in range(1, INPUT_IMAGES_COUNT + 1):
                 with gr.Tab(f"Image {i}"):
                     input_images.append(gr.Image(type = "pil", label = "Target image", show_label = False, elem_id = f"pezdispenser_script_input_image_{i}"))
 
-        gr.HTML('<br />')
+        with gr.Row(elem_id = "pezdispenser_script_input_images_batch_group", visible = False) as input_images_batch_group:
+            input_batch_folder = gr.Textbox(label = "Input directory", lines = 1, max_lines = 1, elem_id = "pezdispenser_script_input_batch_folder")
+
+        gr.HTML("<br />")
         with gr.Row():
             with gr.Column():
                 with gr.Row():
@@ -846,7 +597,7 @@ class Script(scripts.Script):
                     unload_model_button = ToolButton(unload_symbol, elem_id = "pezdispenser_script_unload_model_button")
                     setattr(unload_model_button, "do_not_save_to_config", True)
 
-        gr.HTML('<br />')
+        gr.HTML("<br />")
         with gr.Row():
             with gr.Column():
                 opt_prompt_length = gr.Slider(label = "Prompt length (optimal 8-16)", minimum = 1, maximum = 75, step = 1, value = args.prompt_len, elem_id = "pezdispenser_script_opt_prompt_length")
@@ -859,23 +610,26 @@ class Script(scripts.Script):
             with gr.Accordion("Advanced", open = False):
                 with gr.Row():
                     with gr.Column():
-                        opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_lr")
-                        opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_weight_decay")
+                        opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_lr")
+                        opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_weight_decay")
                     with gr.Column():
-                        opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_prompt_bs")
-                        opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_script__opt_prompt_batch_size")
+                        opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_prompt_bs")
+                        opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_prompt_batch_size")
 
         with gr.Row():
-            gr.HTML(f"<br/>" + VERSION_HTML)
+            gr.HTML(f"<br />" + VERSION_HTML)
 
         def input_type_change(t):
-            input_images_group.visible = (t == "Image to prompt")
-            return gr.Row.update(visible = input_images_group.visible)
+            input_images_group.visible = (t == VALUE_TYPE_IMAGE)
+            input_images_batch_group.visible = (t == VALUE_TYPE_IMAGES_BATCH)
+            return [
+                gr.Row.update(visible = input_images_group.visible),
+                gr.Row.update(visible = input_images_batch_group.visible),
+            ]
         input_type.change(
             fn = input_type_change,
-            #_js = "pezdispenser_show_script_images",
             inputs = [input_type],
-            outputs = [input_images_group]
+            outputs = [input_images_group, input_images_batch_group]
         )
 
         unload_model_button.click(
@@ -884,6 +638,7 @@ class Script(scripts.Script):
 
         res = [
             input_type,
+            input_batch_folder,
             opt_model,
             opt_prompt_length,
             opt_num_step,
@@ -901,6 +656,7 @@ class Script(scripts.Script):
 
     def run(self, p,
         input_type,
+        input_batch_folder,
         model_index,
         prompt_length,
         iterations_count,
@@ -917,25 +673,30 @@ class Script(scripts.Script):
 
         script_name = os.path.splitext(os.path.basename(self.filename))[0]
 
-        if not state.installed:
+        if not utils.state.installed:
             raise ModuleNotFoundError("Some required packages are not installed")
         
-        input_images = list(filter(lambda img: not img is None, args[0:INPUT_IMAGES_COUNT]))
+        parsed_prompts, parsed_extra_networks = parse_prompt(p.prompt) if input_type == VALUE_TYPE_PROMPT else (None, None)
+        input_images = list(filter(lambda img: not img is None, args[0:INPUT_IMAGES_COUNT])) if input_type == VALUE_TYPE_IMAGE else None
+        input_image_files = list(filter(lambda f: os.path.isfile(os.path.join(input_batch_folder, f)) and (f.lower().endswith(".png") or f.lower().endswith(".jpg")), os.listdir(input_batch_folder))) if input_type == VALUE_TYPE_IMAGES_BATCH and os.path.isdir(input_batch_folder) else None
 
-        is_image = input_type == "Image to prompt"
-        parsed_prompts, parsed_extra_networks = parse_prompt(None if is_image else p.prompt)
-
-        if is_image:
-            if len(input_images) == 0:
-                raise ValueError("Input image is empty")
-        else:
+        if input_type == VALUE_TYPE_PROMPT:
             if parsed_prompts is None:
                 raise RuntimeError("Prompt is empty")
+            jobs = [(parsed_prompts, None, None)]
+        elif input_type == VALUE_TYPE_IMAGE:
+            if len(input_images) == 0:
+                raise ValueError("Input image is empty")
+            jobs = [(None, input_images, None)]
+        elif input_type == VALUE_TYPE_IMAGES_BATCH:
+            if len(input_image_files) == 0:
+                raise ValueError("Input directory contain no images")
+            jobs = [(None, None, f) for f in input_image_files]
                 
         iterations_count_norm = int(iterations_count) if iterations_count is not None else 1000
         prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
 
-        shared.state.job_count = p.n_iter
+        shared.state.job_count = len(jobs) * p.n_iter
 
         saved_textinfo = shared.state.textinfo
         shared.state.textinfo = "Loading model..."
@@ -949,41 +710,61 @@ class Script(scripts.Script):
         if (sample_every_iteration > 0) and (sample_every_iteration < iterations_count_norm):
             progress_steps.append(sample_every_iteration)
             run_handler.sample_every_iteration = sample_every_iteration
-            shared.state.job_count = p.n_iter * (((iterations_count_norm - 1) // sample_every_iteration) + 1)
+            shared.state.job_count *= (((iterations_count_norm - 1) // sample_every_iteration) + 1)
 
-        for iteration in range(p.n_iter):
+        for prompts, images, file in jobs:
             if shared.state.interrupted:
                 break
+            for iteration in range(p.n_iter):
+                if shared.state.interrupted:
+                    break
+                
+                if not prompts is None:
+                    this.start_progress("Processing prompt")
+                    target_prompts = prompts
+                    target_images = None
+                elif not images is None:
+                    this.start_progress("Processing image")
+                    target_prompts = None
+                    target_images = images
+                elif not file is None:
+                    this.start_progress(f"Processing file {file}")
+                    target_prompts = None
+                    target_images = [Image.open(os.path.join(input_batch_folder, file))]
+                    
+                saved_textinfo = shared.state.textinfo
+                shared.state.textinfo = this.progress_title + "..."
+                
+                try:
+                    optimized_prompt = utils.optimize_prompt(
+                        model,
+                        preprocess,
+                        torch.device(device_name),
+                        clip_model,
+                        prompt_len,
+                        iterations_count_norm,
+                        float(lr),
+                        float(weight_decay),
+                        int(prompt_bs),
+                        None,
+                        int(batch_size),
+                        target_images = target_images,
+                        target_prompts = target_prompts,
+                        on_progress = on_script_progress,
+                        progress_steps = progress_steps,
+                        progress_args = run_handler
+                    )
+                finally:
+                    if not file is None:
+                        for img in target_images:
+                            img.close()
 
-            this.start_progress("Processing image" if is_image else "Processing prompt")
-            saved_textinfo = shared.state.textinfo
-            shared.state.textinfo = this.progress_title + "..."
-            
-            optimized_prompt = optimize_prompt(
-                model,
-                preprocess,
-                torch.device(device_name),
-                clip_model,
-                prompt_len,
-                iterations_count_norm,
-                float(lr),
-                float(weight_decay),
-                int(prompt_bs),
-                None,
-                int(batch_size),
-                target_images = input_images if is_image else None,
-                target_prompts = None if is_image else parsed_prompts,
-                on_progress = on_script_progress,
-                progress_steps = progress_steps,
-                progress_args = run_handler
-            )
+                shared.state.textinfo = saved_textinfo
 
-            shared.state.textinfo = saved_textinfo
-
-            res = run_handler.run(optimized_prompt)
-
-            if not res:
-                break
+                if shared.state.interrupted:
+                    break
+                if not run_handler.run(optimized_prompt):
+                    break
 
         return Processed(
             p,

@@ -1,7 +1,14 @@
+## 1.3.0
+
+### Features:
+ * Batch images processing in script section
+
+
 ## 1.2.5
 
 ### Features:
  * Predefined SDXL model
+ * Filtering special characters in result
 
 
 ## 1.2.4
