@@ -14,7 +14,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -416,8 +416,15 @@ def create_tab():
                     with gr.Row():
                         interrupt_button = gr.Button("Interrupt", variant = "stop", elem_id = "pezdispenser_interrupt_button", visible = False)
 
+        def unload_model_button_click():
+            res = unload_model()
+            try:
+                gr.Info(res)
+                return ""
+            except:
+                return res
         unload_model_button.click(
-            unload_model,
+            unload_model_button_click,
             outputs = [ statistics_text ]
         )
 
@@ -632,8 +639,15 @@ class Script(scripts.Script):
             outputs = [input_images_group, input_images_batch_group]
         )
 
+        def unload_model_button_click():
+            res = unload_model()
+            try:
+                gr.Info(res)
+                return ""
+            except:
+                return res
         unload_model_button.click(
-            unload_model
+            unload_model_button_click
         )
 
         res = [
@@ -712,30 +726,37 @@ class Script(scripts.Script):
             run_handler.sample_every_iteration = sample_every_iteration
             shared.state.job_count *= (((iterations_count_norm - 1) // sample_every_iteration) + 1)
 
-        for prompts, images, file in jobs:
+        for prompts, images, image_file in jobs:
             if shared.state.interrupted:
                 break
-            for iteration in range(p.n_iter):
-                if shared.state.interrupted:
-                    break
-                
-                if not prompts is None:
-                    this.start_progress("Processing prompt")
-                    target_prompts = prompts
-                    target_images = None
-                elif not images is None:
-                    this.start_progress("Processing image")
-                    target_prompts = None
-                    target_images = images
-                elif not file is None:
-                    this.start_progress(f"Processing file {file}")
-                    target_prompts = None
-                    target_images = [Image.open(os.path.join(input_batch_folder, file))]
-                    
-                saved_textinfo = shared.state.textinfo
-                shared.state.textinfo = this.progress_title + "..."
-                
+
+            if not prompts is None:
+                progress_title = "Processing prompt"
+                target_prompts = prompts
+                target_images = None
+            elif not images is None:
+                progress_title = "Processing image"
+                target_prompts = None
+                target_images = images
+            elif not image_file is None:
+                progress_title = f"Processing file {image_file}"
+                target_prompts = None
                 try:
+                    target_images = [Image.open(os.path.join(input_batch_folder, image_file))]
+                except Exception as ex:
+                    print()
+                    print(f"{ex.__class__.__name__}: {ex}")
+                    continue
+            
+            try:
+                for iteration in range(p.n_iter):
+                    if shared.state.interrupted:
+                        break
+                    
+                    this.start_progress(progress_title)
+                    saved_textinfo = shared.state.textinfo
+                    shared.state.textinfo = this.progress_title + "..."
+                    
                     optimized_prompt = utils.optimize_prompt(
                         model,
                         preprocess,
@@ -754,23 +775,24 @@ class Script(scripts.Script):
                         progress_steps = progress_steps,
                         progress_args = run_handler
                     )
-                finally:
-                    if not file is None:
-                        for img in target_images:
-                            img.close()
 
-                shared.state.textinfo = saved_textinfo
+                    shared.state.textinfo = saved_textinfo
 
-                if shared.state.interrupted:
-                    break
-                if not run_handler.run(optimized_prompt):
-                    break
+                    if shared.state.interrupted:
+                        break
+                    if not run_handler.run(optimized_prompt):
+                        break
+
+            finally:
+                if not image_file is None:
+                    for img in target_images:
+                        img.close()
 
         return Processed(
             p,
             run_handler.res_images,
             seed = p.seed,
-            info = "" if run_handler.res_info is None else run_handler.res_info,
+            info = run_handler.res_info or "",
             all_prompts = run_handler.res_all_prompts,
             infotexts = run_handler.res_infotexts
         )

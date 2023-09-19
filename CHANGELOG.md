@@ -1,3 +1,12 @@
+## 1.3.1
+
+### Features:
+ * Unload model notification
+
+### Bug Fixes:
+ * Minor batch images processing fixes
+
+
 ## 1.3.0
 
 ### Features:
