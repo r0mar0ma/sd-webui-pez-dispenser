@@ -1,3 +1,9 @@
+## 1.3.2
+
+### Features:
+ * New option in script section: Do not make repetitive samples
+
+
 ## 1.3.1
 
 ### Features:

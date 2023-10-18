@@ -14,7 +14,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -64,7 +64,8 @@ args.__dict__.update(json.loads("""
     "clip_model": "ViT-L-14",
     "clip_pretrain": "openai",
     "device": null,
-    "sample_on_iter": 0
+    "sample_on_iter": 0,
+    "dont_sample_repetitive": false
 }
 """))
 if os.path.isfile(config_file_path):
@@ -389,7 +390,7 @@ def create_tab():
 
                 with gr.Row():
                     with gr.Accordion("Advanced", open = False):
-                        with gr.Row():
+                        with gr.Row(variant="compact"):
                             with gr.Column():
                                 opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_lr")
                                 opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_weight_decay")
@@ -507,7 +508,7 @@ script_callbacks.on_script_unloaded(on_unload)
 ########## Script ##########
 
 class ScriptRunHandler:
-    def __init__(self, p, parsed_extra_networks):
+    def __init__(self, p, parsed_extra_networks, dont_sample_repetitive):
 
         self.p = p
         self.parsed_extra_networks = parsed_extra_networks or ""
@@ -519,13 +520,27 @@ class ScriptRunHandler:
         
         self.sample_every_iteration = 0
 
+        self.last_run_prompt = ""
+        self.dont_sample_repetitive = dont_sample_repetitive
+
     def run(self, prompt):
         if shared.state.interrupted:
             return False
 
+        run_prompt = normalize_result(prompt) + self.parsed_extra_networks
+
+        if self.dont_sample_repetitive and self.last_run_prompt == run_prompt:
+            cols, _ = os.get_terminal_size()
+            print("\r", end = "", flush = True)
+            print(" " * cols, end = "", flush = True)
+            print("\rSkipping repetitive sample", flush = True)
+            shared.state.nextjob()
+            return True
+        self.last_run_prompt = run_prompt
+
         pc = copy.copy(self.p)
         pc.n_iter = 1
-        pc.prompt = normalize_result(prompt) + self.parsed_extra_networks
+        pc.prompt = run_prompt
         pi = process_images(pc)
 
         if shared.state.interrupted or pi.images is None:
@@ -605,17 +620,17 @@ class Script(scripts.Script):
                     setattr(unload_model_button, "do_not_save_to_config", True)
 
         gr.HTML("<br />")
-        with gr.Row():
+        with gr.Row(variant="compact"):
             with gr.Column():
                 opt_prompt_length = gr.Slider(label = "Prompt length (optimal 8-16)", minimum = 1, maximum = 75, step = 1, value = args.prompt_len, elem_id = "pezdispenser_script_opt_prompt_length")
-            with gr.Column():
                 opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = "pezdispenser_script_opt_num_step")
             with gr.Column():
                 opt_sample_step = gr.Slider(label = "Sample on every step (0 - disabled)", minimum = 0, maximum = 10000, step = 1, value = args.sample_on_iter, elem_id = "pezdispenser_script_opt_sample_step")
+                opt_sample_repetitive = gr.Checkbox(label = "Do not make repetitive samples", value = args.dont_sample_repetitive, elem_id = "pezdispenser_script_opt_sample_repetitive")
 
         with gr.Row():
             with gr.Accordion("Advanced", open = False):
-                with gr.Row():
+                with gr.Row(variant="compact"):
                     with gr.Column():
                         opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_lr")
                         opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_weight_decay")
@@ -657,6 +672,7 @@ class Script(scripts.Script):
             opt_prompt_length,
             opt_num_step,
             opt_sample_step,
+            opt_sample_repetitive,
             opt_lr,
             opt_weight_decay,
             opt_prompt_bs,
@@ -675,6 +691,7 @@ class Script(scripts.Script):
         prompt_length,
         iterations_count,
         sample_every_iteration,
+        dont_sample_repetitive,
         lr,
         weight_decay,
         prompt_bs,
@@ -718,7 +735,7 @@ class Script(scripts.Script):
         model, preprocess, clip_model = load_model(model_index, device_name)
         shared.state.textinfo = saved_textinfo
 
-        run_handler = ScriptRunHandler(p, parsed_extra_networks)
+        run_handler = ScriptRunHandler(p, parsed_extra_networks, dont_sample_repetitive)
 
         progress_steps = [ max(iterations_count_norm // 100, 10) ]
         if (sample_every_iteration > 0) and (sample_every_iteration < iterations_count_norm):
