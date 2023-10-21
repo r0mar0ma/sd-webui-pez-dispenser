@@ -1,3 +1,9 @@
+## 1.4.0
+
+### Features:
+ * Extra images for batch processing
+
+
 ## 1.3.2
 
 ### Features:
