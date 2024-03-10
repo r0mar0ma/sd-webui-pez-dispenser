@@ -14,7 +14,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
