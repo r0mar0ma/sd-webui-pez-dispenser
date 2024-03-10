@@ -1,3 +1,9 @@
+## 1.4.1
+
+### Bug Fixes:
+ * Fixed incompatibility issue with WebUI 1.8.0
+
+
 ## 1.4.0
 
 ### Features:
