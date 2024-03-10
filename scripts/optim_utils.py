@@ -20,6 +20,7 @@ state = State()
 import torch
 from torch import Tensor, device
 from typing import List, Callable
+import numpy as np
 
 state.installed = True
 
