@@ -1,3 +1,9 @@
+## 1.4.2
+
+### Bug Fixes:
+ * Fixed an issue with additional images in batch processing
+
+
 ## 1.4.1
 
 ### Bug Fixes:

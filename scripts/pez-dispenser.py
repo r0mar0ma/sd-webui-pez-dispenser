@@ -14,7 +14,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -722,7 +722,6 @@ class Script(scripts.Script):
         
         input_images = list(filter(lambda img: not img is None, input_images_args)) if input_type == VALUE_TYPE_IMAGE else None
 
-        input_batch_images = list(filter(lambda img: not img is None, input_batch_images_args)) if input_type == VALUE_TYPE_IMAGES_BATCH else None
         input_image_files = list(filter(lambda f: os.path.isfile(os.path.join(input_batch_folder, f)) and (f.lower().endswith(".png") or f.lower().endswith(".jpg")), os.listdir(input_batch_folder))) if input_type == VALUE_TYPE_IMAGES_BATCH and os.path.isdir(input_batch_folder) else None
 
         if input_type == VALUE_TYPE_PROMPT:
@@ -773,7 +772,8 @@ class Script(scripts.Script):
                 progress_title = f"Processing file {image_file}"
                 target_prompts = None
                 try:
-                    target_images = [Image.open(os.path.join(input_batch_folder, image_file))] + input_batch_images
+                    input_batch_images = list(filter(lambda img: not img is None, input_batch_images_args)) if input_type == VALUE_TYPE_IMAGES_BATCH else None
+                    target_images = [Image.open(os.path.join(input_batch_folder, image_file))] + [i.copy() for i in input_batch_images]
                 except Exception as ex:
                     print()
                     print(f"{ex.__class__.__name__}: {ex}")
