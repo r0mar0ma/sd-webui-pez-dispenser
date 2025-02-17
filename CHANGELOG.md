@@ -1,3 +1,9 @@
+## 1.4.3
+
+### Bug Fixes:
+ * Removed incompatible models selection
+
+
 ## 1.4.2
 
 ### Bug Fixes:

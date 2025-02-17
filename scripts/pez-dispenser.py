@@ -14,7 +14,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -115,13 +115,23 @@ if ALLOW_DEVICE_SELECTION:
 
 ########## Models ##########
 
+allowed_models = [
+    r"^RN[0-9]+",
+    r"^ViT-",
+    r"^convnext_base",
+    r"^convnext_large"
+]
+
 pretrained_models = [
     ("SD 1.5 (ViT-L-14, openai)", "ViT-L-14", "openai"),
     ("SD 2.0, Midjourney (ViT-H-14, laion2b_s32b_b79k)", "ViT-H-14", "laion2b_s32b_b79k"),
     ("SDXL 1.0 (ViT-bigG-14, laion2b_s39b_b160k)", "ViT-bigG-14", "laion2b_s39b_b160k")
 ]
 for m, p in open_clip.pretrained.list_pretrained(as_str = False):
-    pretrained_models.append((f"{m}, {p}", m, p))
+    for r in allowed_models:
+        if re.match(r, m, re.I):
+            pretrained_models.append((f"{m}, {p}", m, p))
+            break
 
 for i in range(len(pretrained_models)):
     if pretrained_models[i][1] == args.clip_model and pretrained_models[i][2] == args.clip_pretrain:
