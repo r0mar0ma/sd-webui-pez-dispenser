@@ -1,3 +1,9 @@
+## 1.5.0
+
+### Features:
+ * Ability to use prompt as addition to image and in batch processing
+
+
 ## 1.4.3
 
 ### Bug Fixes:

@@ -357,11 +357,20 @@ def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters
     tokenizer = open_clip.tokenizer._tokenizer
 
     # get target features
+    image_target_features = None
+    text_target_features = None
     if not target_images is None:
-        all_target_features = get_target_feature_images(model, preprocess, device, target_images)
-    elif not target_prompts is None:
+        image_target_features = get_target_feature_images(model, preprocess, device, target_images)
+    if not target_prompts is None:
         tokenizer_funct = open_clip.get_tokenizer(clip_model)
-        all_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts)
+        text_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts)
+
+    if (not image_target_features is None) and (not text_target_features is None):
+        all_target_features = torch.cat((text_target_features, image_target_features), dim = 0)
+    elif not image_target_features is None:
+        all_target_features = image_target_features
+    elif not text_target_features is None:
+        all_target_features = text_target_features
     else:
         raise ValueError("No input images or prompts")
     

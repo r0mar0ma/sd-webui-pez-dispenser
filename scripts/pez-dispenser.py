@@ -14,7 +14,8 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-VERSION = "1.4.3"
+
+VERSION = "1.5.0"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -114,6 +115,14 @@ if ALLOW_DEVICE_SELECTION:
         this.model_device_name = args.device
 
 ########## Models ##########
+
+if not "metaclip_fullcc" in open_clip.pretrained._VITbigG14:
+    open_clip.pretrained._VITbigG14["metaclip_fullcc"] = open_clip.pretrained._pcfg(
+        #url='https://dl.fbaipublicfiles.com/MMPT/metaclip/G14_fullcc2.5b.pt',
+        hf_hub="timm/vit_gigantic_patch14_clip_224.metaclip_2pt5b/",
+        #quick_gelu=True,
+    )
+
 
 allowed_models = [
     r"^RN[0-9]+",
@@ -252,6 +261,8 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
 
         parsed_prompts, parsed_extra_networks = parse_prompt(target_prompt)
         parsed_images = list() if target_images is None else list(filter(lambda i: not i is None, target_images))
+        print(parsed_prompts)
+        print(parsed_images)
 
         if len(parsed_images) == 0 and parsed_prompts is None:
             raise ValueError("Nothing to process")
@@ -614,9 +625,13 @@ class Script(scripts.Script):
                 choices = [ VALUE_TYPE_PROMPT, VALUE_TYPE_IMAGE, VALUE_TYPE_IMAGES_BATCH ], value = VALUE_TYPE_PROMPT, elem_id = "pezdispenser_script_input_type")
 
         with gr.Row(elem_id = "pezdispenser_script_input_images_group", visible = False) as input_images_group:
-            for i in range(INPUT_IMAGES_COUNT):
-                with gr.Tab("Image" if i == 0 else f"Extra image {i}"):
-                    input_images.append(gr.Image(type = "pil", show_label = False, elem_id = f"pezdispenser_script_input_image_{i}"))
+            with gr.Column():
+                with gr.Row():
+                    for i in range(INPUT_IMAGES_COUNT):
+                        with gr.Tab("Image" if i == 0 else f"Extra image {i}"):
+                            input_images.append(gr.Image(type = "pil", show_label = False, elem_id = f"pezdispenser_script_input_image_{i}"))
+                with gr.Row():
+                    input_images_use_prompt = gr.Checkbox(label = 'Use prompt', value = False, elem_id = "pezdispenser_script_input_images_use_prompt")
 
         with gr.Row(elem_id = "pezdispenser_script_input_images_batch_group", visible = False) as input_images_batch_group:
             with gr.Column():
@@ -627,6 +642,8 @@ class Script(scripts.Script):
                         for i in range(1, INPUT_IMAGES_COUNT):
                             with gr.Tab(f"Extra image {i}"):
                                 input_batch_images.append(gr.Image(type = "pil", show_label = False, elem_id = f"pezdispenser_script_input_batch_image_{i}"))
+                with gr.Row():
+                    input_batch_images_use_prompt = gr.Checkbox(label = 'Use prompt', value = False, elem_id = "pezdispenser_script_input_batch_images_use_prompt")
 
         gr.HTML("<br />")
         with gr.Row():
@@ -685,6 +702,8 @@ class Script(scripts.Script):
 
         res = [
             input_type,
+            input_images_use_prompt,
+            input_batch_images_use_prompt,
             input_batch_folder,
             opt_model,
             opt_prompt_length,
@@ -704,6 +723,8 @@ class Script(scripts.Script):
 
     def run(self, p,
         input_type,
+        input_images_use_prompt,
+        input_batch_images_use_prompt,
         input_batch_folder,
         model_index,
         prompt_length,
@@ -725,27 +746,42 @@ class Script(scripts.Script):
         if not utils.state.installed:
             raise ModuleNotFoundError("Some required packages are not installed")
 
-        input_images_args = args[0:INPUT_IMAGES_COUNT]
-        input_batch_images_args = args[INPUT_IMAGES_COUNT:INPUT_IMAGES_COUNT + INPUT_IMAGES_COUNT - 1]
-
-        parsed_prompts, parsed_extra_networks = parse_prompt(p.prompt) if input_type == VALUE_TYPE_PROMPT else (None, None)
+        parsed_prompts, parsed_extra_networks = parse_prompt(p.prompt)
         
-        input_images = list(filter(lambda img: not img is None, input_images_args)) if input_type == VALUE_TYPE_IMAGE else None
-
-        input_image_files = list(filter(lambda f: os.path.isfile(os.path.join(input_batch_folder, f)) and (f.lower().endswith(".png") or f.lower().endswith(".jpg")), os.listdir(input_batch_folder))) if input_type == VALUE_TYPE_IMAGES_BATCH and os.path.isdir(input_batch_folder) else None
-
         if input_type == VALUE_TYPE_PROMPT:
             if parsed_prompts is None:
                 raise RuntimeError("Prompt is empty")
+            
             jobs = [(parsed_prompts, None, None)]
+
         elif input_type == VALUE_TYPE_IMAGE:
+            input_images_args = args[0:INPUT_IMAGES_COUNT]
+            input_images = list(filter(lambda img: not img is None, input_images_args))
+
             if input_images is None or len(input_images) == 0:
                 raise ValueError("Input image is empty")
-            jobs = [(None, input_images, None)]
+            
+            jobs = [(
+                parsed_prompts if input_images_use_prompt else None,
+                input_images,
+                None
+            )]
+        
         elif input_type == VALUE_TYPE_IMAGES_BATCH:
+            input_batch_images_args = args[INPUT_IMAGES_COUNT:INPUT_IMAGES_COUNT + INPUT_IMAGES_COUNT - 1]
+            input_batch_images = list(filter(lambda img: not img is None, input_batch_images_args))
+            
+            if not os.path.isdir(input_batch_folder):
+                raise ValueError("Input directory does not exist")
+            input_image_files = sorted(list(filter(lambda f: os.path.isfile(os.path.join(input_batch_folder, f)) and (f.lower().endswith(".png") or f.lower().endswith(".jpg") or f.lower().endswith(".jpeg")), os.listdir(input_batch_folder))))
             if input_image_files is None or len(input_image_files) == 0:
                 raise ValueError("Input directory has no images")
-            jobs = [(None, None, f) for f in input_image_files]
+            
+            jobs = [(
+                parsed_prompts if input_batch_images_use_prompt else None,
+                input_batch_images,
+                f
+            ) for f in input_image_files]
                 
         iterations_count_norm = int(iterations_count) if iterations_count is not None else 1000
         prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
@@ -770,20 +806,17 @@ class Script(scripts.Script):
             if shared.state.interrupted:
                 break
 
-            if not prompts is None:
+            target_prompts = prompts
+            target_images = images
+
+            if input_type == VALUE_TYPE_PROMPT:
                 progress_title = "Processing prompt"
-                target_prompts = prompts
-                target_images = None
-            elif not images is None:
+            elif input_type == VALUE_TYPE_IMAGE:
                 progress_title = "Processing image"
-                target_prompts = None
-                target_images = images
-            elif not image_file is None:
+            elif input_type == VALUE_TYPE_IMAGES_BATCH:
                 progress_title = f"Processing file {image_file}"
-                target_prompts = None
                 try:
-                    input_batch_images = list(filter(lambda img: not img is None, input_batch_images_args)) if input_type == VALUE_TYPE_IMAGES_BATCH else None
-                    target_images = [Image.open(os.path.join(input_batch_folder, image_file))] + [i.copy() for i in input_batch_images]
+                    target_images = [Image.open(os.path.join(input_batch_folder, image_file))] + [i.copy() for i in images]
                 except Exception as ex:
                     print()
                     print(f"{ex.__class__.__name__}: {ex}")
@@ -825,7 +858,7 @@ class Script(scripts.Script):
                         break
 
             finally:
-                if not image_file is None:
+                if not target_images is None:
                     for img in target_images:
                         img.close()
 
