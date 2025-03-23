@@ -2,7 +2,23 @@ import time
 import copy
 import open_clip
 import torch
+
+try:
+    from transformers.optimization import Adafactor
+except:
+    pass
+
 from modules import shared
+
+TORCH_COMPILE_LEVEL_OFF = 0
+TORCH_COMPILE_LEVEL_MAX = 3
+
+optimizers = {
+    "AdamW": "Default",
+    "Lion": "Generally faster",
+    "SGD": "Simpler calculations per step, slightly higher lr",
+    "Adafactor": "Less memory, faster for large models"
+}
 
 class State:
     installed = False
@@ -135,6 +151,42 @@ def normalize_embeddings(embeddings: Tensor):
 
 ##################################################
 
+# Simple Lion optimizer implementation
+class Lion(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                    
+                # Perform weight decay
+                if group['weight_decay'] != 0:
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                    
+                grad = p.grad
+                state = self.state[p]
+                
+                # State initialization
+                if len(state) == 0:
+                    state['exp_avg'] = torch.zeros_like(p)
+                    
+                exp_avg = state['exp_avg']
+                beta1, beta2 = group['betas']
+                
+                # Update moving average
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                
+                # Update weights
+                update = exp_avg.sign()
+                p.add_(update, alpha=-group['lr'])
+
+##################################################
+
 def nn_project(curr_embeds, embedding_layer, print_hits=False):
     with torch.no_grad():
         bsz,seq_len,emb_dim = curr_embeds.shape
@@ -153,11 +205,11 @@ def nn_project(curr_embeds, embedding_layer, print_hits=False):
                                 top_k=1,
                                 score_function=dot_score)
 
-        if print_hits:
-            all_hits = []
-            for hit in hits:
-                all_hits.append(hit[0]["score"])
-            print(f"mean hits:{mean(all_hits)}")
+        #if print_hits:
+        #    all_hits = []
+        #    for hit in hits:
+        #        all_hits.append(hit[0]["score"])
+        #    print(f"mean hits:{mean(all_hits)}")
         
         nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
         nn_indices = nn_indices.reshape((bsz,seq_len))
@@ -165,7 +217,6 @@ def nn_project(curr_embeds, embedding_layer, print_hits=False):
         projected_embeds = embedding_layer(nn_indices)
 
     return projected_embeds, nn_indices
-
 
 def decode_ids(input_ids, tokenizer, by_token=False):
     input_ids = input_ids.detach().cpu().numpy()
@@ -184,7 +235,6 @@ def decode_ids(input_ids, tokenizer, by_token=False):
             texts.append(tokenizer.decode(input_ids_i))
 
     return texts
-
 
 def get_target_feature_images(model, preprocess, device, target_images):
     with torch.no_grad():
@@ -229,10 +279,34 @@ def initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs)
     return prompt_embeds, dummy_embeds, dummy_ids
 
 
-def encode_text_embedding(model, text_embedding, ids, avg_text=False):
+#def encode_text_embedding(model, text_embedding, ids, avg_text=False):
+#    cast_dtype = model.transformer.get_cast_dtype()
+#
+#    x = text_embedding + model.positional_embedding.to(cast_dtype)
+#    x = x.permute(1, 0, 2)  # NLD -> LND
+#    x = model.transformer(x, attn_mask=model.attn_mask)
+#    x = x.permute(1, 0, 2)  # LND -> NLD
+#    x = model.ln_final(x)
+#
+#    # x.shape = [batch_size, n_ctx, transformer.width]
+#    # take features from the eot embedding (eot_token is the highest number in each sequence)
+#    if avg_text:
+#        x = x[torch.arange(x.shape[0]), :ids.argmax(dim=-1)]
+#        x[:, 1:-1]
+#        x = x.mean(dim=1) @ model.text_projection
+#    else:
+#        x = x[torch.arange(x.shape[0]), ids.argmax(dim=-1)] @ model.text_projection
+#
+#    return x
+#
+#encode_text_embedding = torch.compile(encode_text_embedding, mode = "max-autotune", backend = torch_compile_backend)
+    
+def _forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
+
+    ##### def encode_text_embedding(model, embeddings, ids, avg_text=False):
     cast_dtype = model.transformer.get_cast_dtype()
 
-    x = text_embedding + model.positional_embedding.to(cast_dtype)
+    x = embeddings + model.positional_embedding.to(cast_dtype)
     x = x.permute(1, 0, 2)  # NLD -> LND
     x = model.transformer(x, attn_mask=model.attn_mask)
     x = x.permute(1, 0, 2)  # LND -> NLD
@@ -247,10 +321,10 @@ def encode_text_embedding(model, text_embedding, ids, avg_text=False):
     else:
         x = x[torch.arange(x.shape[0]), ids.argmax(dim=-1)] @ model.text_projection
 
-    return x
-    
-def forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
-    text_features = encode_text_embedding(model, embeddings, ids, avg_text=avg_text)
+    text_features = x
+    #####
+    #text_features = encode_text_embedding(model, embeddings, ids, avg_text=avg_text)
+    #####
 
     if return_feature:
         return text_features
@@ -267,14 +341,89 @@ def forward_text_embedding(model, embeddings, ids, image_features, avg_text=Fals
     # shape = [global_batch_size, global_batch_size]
     return logits_per_image, logits_per_text
 
+_forward_text_embedding_compiled_level = 0
+_forward_text_embedding_compiled = None
+_forward_text_embedding_compiled_valid = False
+_forward_text_embedding_compiled_cuda = False
 
-def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, device, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, on_progress, progress_steps, progress_args):
+def forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
+    global _forward_text_embedding_compiled_valid
+    if _forward_text_embedding_compiled_valid:
+        try:
+            if _forward_text_embedding_compiled_cuda:
+                torch.compiler.cudagraph_mark_step_begin()
+            return _forward_text_embedding_compiled(model, embeddings, ids, image_features, avg_text, return_feature)
+        except Exception as e:
+            print(f"Unable to use compiled forward_text_embedding(), reverting to plain one: {e}")
+            _forward_text_embedding_compiled_valid = False
+    return _forward_text_embedding(model, embeddings, ids, image_features, avg_text, return_feature)
+
+def get_torch_compile_mode(torch_compile_level):
+    if torch_compile_level <= 1:
+        return "default"
+    elif torch_compile_level == 2:
+        return "max-autotune-no-cudagraphs"
+    else:
+        return "max-autotune"
+
+def init_forward_text_embedding(torch_compile_level=0):
+    global _forward_text_embedding_compiled_level
+    global _forward_text_embedding_compiled
+    global _forward_text_embedding_compiled_valid
+    global _forward_text_embedding_compiled_cuda
+    if torch_compile_level <= 0:
+        _forward_text_embedding_compiled = None
+        _forward_text_embedding_compiled_valid = False
+        _forward_text_embedding_compiled_cuda = False
+    else:
+        if torch_compile_level == 1:
+            _forward_text_embedding_compiled_valid = True
+            _forward_text_embedding_compiled_cuda = False
+        elif torch_compile_level == 2:
+            _forward_text_embedding_compiled_valid = True
+            _forward_text_embedding_compiled_cuda = False
+        else:
+            _forward_text_embedding_compiled_valid = True
+            _forward_text_embedding_compiled_cuda = True
+
+        if _forward_text_embedding_compiled_level != torch_compile_level:
+           _forward_text_embedding_compiled_level = torch_compile_level
+           _forward_text_embedding_compiled = torch.compile(_forward_text_embedding, mode = get_torch_compile_mode(torch_compile_level))
+
+
+
+def optimize_prompt_loop(
+    model, 
+    tokenizer, 
+    token_embedding, 
+    all_target_features, 
+    device, prompt_len, 
+    opt_iters, 
+    lr, 
+    weight_decay, 
+    prompt_bs, 
+    print_step, 
+    batch_size, 
+    optimizer,
+    on_progress, 
+    progress_steps, 
+    progress_args
+):
     # initialize prompt
     prompt_embeds, dummy_embeds, dummy_ids = initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs)
     p_bs, p_len, p_dim = prompt_embeds.shape
 
     # get optimizer
-    input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
+    if optimizer == "AdamW":
+        input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
+    elif optimizer == "Lion":
+        input_optimizer = Lion([prompt_embeds], lr=lr, betas=(0.9, 0.99), weight_decay=weight_decay)
+    elif optimizer == "SGD":
+        input_optimizer = torch.optim.SGD([prompt_embeds], lr=lr, momentum=0.9)
+    elif optimizer == "Adafactor":
+        input_optimizer = Adafactor([prompt_embeds], lr=lr, relative_step=False)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer}")
 
     best_sim = 0
     best_text = ""
@@ -296,7 +445,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
             target_features = all_target_features[curr_indx][0:batch_size]
             
         universal_target_features = all_target_features
-        
+
         # forward projection
         projected_embeds, nn_indices = nn_project(prompt_embeds, token_embedding, print_hits=False)
 
@@ -316,7 +465,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
         # padding
         padded_embeds = dummy_embeds.detach().clone()
         padded_embeds[dummy_ids == -1] = tmp_embeds.reshape(-1, p_dim)
-        
+            
         logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, target_features)
         cosim_scores = logits_per_image
         loss = 1 - cosim_scores.mean()
@@ -330,6 +479,7 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
         cosim_scores = cosim_scores.mean().item()
 
         decoded_text = decode_ids(nn_indices, tokenizer)[best_indx]
+
         if print_step is not None and (step % print_step == 0 or step == opt_iters-1):
             print(f"step: {step}, lr: {curr_lr}, cosim: {universal_cosim_score:.3f}, text: {decoded_text}")
         
@@ -349,9 +499,30 @@ def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features,
     return best_text
 
 
-def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size, target_images=None, target_prompts=None, on_progress=None, progress_steps=[1], progress_args=None):
+def optimize_prompt(
+    model,
+    preprocess,
+    device,
+    clip_model,
+    prompt_len,
+    opt_iters,
+    lr,
+    weight_decay,
+    prompt_bs,
+    print_step,
+    batch_size,
+    target_images=None,
+    target_prompts=None,
+    on_progress=None,
+    progress_steps=[1],
+    progress_args=None,
+    optimizer = "AdamW",
+    torch_compile_level=0
+):
     if not state.installed:
         raise ModuleNotFoundError("Some required packages are not installed")
+
+    init_forward_text_embedding(torch_compile_level)
 
     token_embedding = model.token_embedding
     tokenizer = open_clip.tokenizer._tokenizer
@@ -378,6 +549,7 @@ def optimize_prompt(model, preprocess, device, clip_model, prompt_len, opt_iters
     learned_prompt = optimize_prompt_loop(
         model, tokenizer, token_embedding, all_target_features, device,
         prompt_len, opt_iters, lr, weight_decay, prompt_bs, print_step, batch_size,
+        optimizer,
         on_progress, progress_steps, progress_args
     )
     

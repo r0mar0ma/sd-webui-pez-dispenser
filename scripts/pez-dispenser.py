@@ -15,7 +15,7 @@ from modules.ui_components import ToolButton
 from PIL import Image
 
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -66,7 +66,9 @@ args.__dict__.update(json.loads("""
     "clip_pretrain": "openai",
     "device": null,
     "sample_on_iter": 0,
-    "dont_sample_repetitive": false
+    "dont_sample_repetitive": false,
+    "optimizer": "AdamW",
+    "torch_compile_level": 0
 }
 """))
 if os.path.isfile(config_file_path):
@@ -174,7 +176,6 @@ def unload_model():
     return msg
 
 
-
 def load_model(index, device_name):
     if this.model is None or this.preprocess is None or this.model_index != index or this.model_device_name != device_name:
         _, clip_model, clip_pretrain = pretrained_models[index];
@@ -189,6 +190,15 @@ def load_model(index, device_name):
             memory_used_pre = torch.cuda.memory_allocated(device)
 
         model, _, preprocess = open_clip.create_model_and_transforms(clip_model, pretrained = clip_pretrain, device = device)
+
+        ## experimental torch.compile()
+        #if not utils.torch_compile_mode is None:
+        #    try:
+        #        compiled_model = torch.compile(model, mode = utils.torch_compile_mode)
+        #        del model
+        #        model = compiled_model
+        #    except:
+        #        pass
 
         this.model = model
         this.preprocess = preprocess
@@ -227,10 +237,17 @@ def parse_prompt(prompt):
     
     return parsed_prompts, parsed_extra_networks
 
-re_normalize_result = re.compile(r"""[()[\]{}<>\\|/~!?@#$%^&*"']""")
+re_normalize_result = [
+    (re.compile(r"""[()[\]{}<>\\|/`~!?@#$%^&*+=:;"'\t\r\n]"""), " "),
+    #(re.compile(r"""\s[.-]+\s"""), " "),
+    (re.compile(r"""\s+"""), " ")
+]
 
 def normalize_result(prompt):
-    return re.sub(re_normalize_result, " ", prompt)
+    res = prompt
+    for r, s in re_normalize_result:
+        res = re.sub(r, s, res)
+    return res.strip()
 
 def on_progress(step, total, prompt, progress_args):
     if step == 0:
@@ -246,7 +263,21 @@ def on_progress(step, total, prompt, progress_args):
     shared.state.job_no = step - 1
     shared.state.nextjob()
 
-def inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_images = None, target_prompt = None):
+def inference(
+    task_id, 
+    model_index, 
+    device_name_index, 
+    prompt_length, 
+    iterations_count, 
+    lr, 
+    weight_decay, 
+    prompt_bs, 
+    batch_size, 
+    optimizer,
+    torch_compile_level,
+    target_images = None, 
+    target_prompt = None
+):
     progress.add_task_to_queue(task_id)
     shared.state.begin()
     progress.start_task(task_id)
@@ -261,8 +292,8 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
 
         parsed_prompts, parsed_extra_networks = parse_prompt(target_prompt)
         parsed_images = list() if target_images is None else list(filter(lambda i: not i is None, target_images))
-        print(parsed_prompts)
-        print(parsed_images)
+        #print(parsed_prompts)
+        #print(parsed_images)
 
         if len(parsed_images) == 0 and parsed_prompts is None:
             raise ValueError("Nothing to process")
@@ -291,6 +322,8 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
             int(batch_size),
             target_images = parsed_images if len(parsed_images) > 0 else None,
             target_prompts = parsed_prompts if not parsed_prompts is None else None,
+            optimizer = list(utils.optimizers)[optimizer],
+            torch_compile_level = torch_compile_level,
             on_progress = on_progress,
             progress_steps = [ max(iter // 100, 10) ]
         )
@@ -314,13 +347,65 @@ def inference(task_id, model_index, device_name_index, prompt_length, iterations
 
     return res
 
-def inference_image(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, *target_images):
+def inference_image(
+    task_id, 
+    model_index, 
+    device_name_index, 
+    prompt_length, 
+    iterations_count, 
+    lr, 
+    weight_decay, 
+    prompt_bs, 
+    batch_size, 
+    optimizer,
+    torch_compile_level,
+    *target_images
+):
     this.start_progress("Processing image")
-    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_images = target_images)
+    return inference(
+        task_id, 
+        model_index, 
+        device_name_index, 
+        prompt_length, 
+        iterations_count, 
+        lr, 
+        weight_decay, 
+        prompt_bs, 
+        batch_size, 
+        optimizer,
+        torch_compile_level,
+        target_images = target_images
+    )
 
-def inference_text(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_prompt):
+def inference_text(
+    task_id, 
+    model_index, 
+    device_name_index, 
+    prompt_length, 
+    iterations_count, 
+    lr, 
+    weight_decay, 
+    prompt_bs, 
+    batch_size, 
+    optimizer,
+    torch_compile_level,
+    target_prompt
+):
     this.start_progress("Processing prompt")
-    return inference(task_id, model_index, device_name_index, prompt_length, iterations_count, lr, weight_decay, prompt_bs, batch_size, target_prompt = target_prompt if not target_prompt is None and target_prompt != "" else None)
+    return inference(
+        task_id, 
+        model_index, 
+        device_name_index, 
+        prompt_length, 
+        iterations_count, 
+        lr, 
+        weight_decay, 
+        prompt_bs, 
+        batch_size, 
+        optimizer,
+        torch_compile_level,
+        target_prompt = target_prompt if not target_prompt is None and target_prompt != "" else None
+    )
 
 def interrupt():
     shared.state.interrupt()
@@ -413,11 +498,23 @@ def create_tab():
                     with gr.Accordion("Advanced", open = False):
                         with gr.Row(variant="compact"):
                             with gr.Column():
-                                opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_lr")
-                                opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_weight_decay")
+                                opt_lr = gr.Textbox(label = "Learning rate for optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_lr")
+                                opt_weight_decay = gr.Textbox(label = "Weight decay for optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_weight_decay")
                             with gr.Column():
                                 opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_bs")
                                 opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_batch_size")
+
+                with gr.Row():
+                    with gr.Accordion("Experimental", open = False):
+                        with gr.Row(variant="compact"):
+                            with gr.Column():
+                                optimizers_names = [ f"{n} ({d})" for n, d in utils.optimizers.items() ]
+                                args_optimizer = optimizers_names[list(utils.optimizers).index(args.optimizer)] if args.optimizer in utils.optimizers else optimizers_names[0]
+                                opt_optimizer = gr.Dropdown(label = "Optimizer", choices = optimizers_names, type = "index", 
+                                    value = args_optimizer, elem_id = "pezdispenser_script_opt_optimizer")
+                                opt_torch_compile_level = gr.Slider(label = "Torch compilation level", 
+                                    minimum = utils.TORCH_COMPILE_LEVEL_OFF, maximum = utils.TORCH_COMPILE_LEVEL_MAX, step = 1, 
+                                    value = args.torch_compile_level, elem_id = "pezdispenser_script_opt_torch_compile_level")
 
                 with gr.Row():
                     gr.HTML(VERSION_HTML)
@@ -453,13 +550,38 @@ def create_tab():
         process_image_button.click(
             ui.wrap_queued_call(inference_image),
             _js = "pezdispenser_submit",
-            inputs = [input_text, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size] + input_images,
+            inputs = [
+                input_text, 
+                opt_model, 
+                opt_device, 
+                opt_prompt_length, 
+                opt_num_step, 
+                opt_lr, 
+                opt_weight_decay, 
+                opt_prompt_bs, 
+                opt_batch_size,
+                opt_optimizer,
+                opt_torch_compile_level,
+            ] + input_images,
             outputs = [output_prompt, statistics_text]
         )
         process_text_button.click(
             ui.wrap_queued_call(inference_text),
             _js = "pezdispenser_submit",
-            inputs = [input_text, opt_model, opt_device, opt_prompt_length, opt_num_step, opt_lr, opt_weight_decay, opt_prompt_bs, opt_batch_size, input_text],
+            inputs = [
+                input_text, 
+                opt_model, 
+                opt_device, 
+                opt_prompt_length, 
+                opt_num_step, 
+                opt_lr, 
+                opt_weight_decay, 
+                opt_prompt_bs, 
+                opt_batch_size, 
+                opt_optimizer,
+                opt_torch_compile_level,
+                input_text
+            ],
             outputs = [output_prompt, statistics_text]
         )
         interrupt_button.click(interrupt)
@@ -487,7 +609,9 @@ def create_tab():
         opt_weight_decay,
         opt_prompt_bs,
         opt_batch_size,
-        input_text
+        opt_optimizer,
+        opt_torch_compile_level,
+        input_text,
     ] + input_images:
         setattr(obj, "do_not_save_to_config", True)
 
@@ -529,10 +653,9 @@ script_callbacks.on_script_unloaded(on_unload)
 ########## Script ##########
 
 class ScriptRunHandler:
-    def __init__(self, p, parsed_extra_networks, dont_sample_repetitive):
+    def __init__(self, p, dont_sample_repetitive):
 
         self.p = p
-        self.parsed_extra_networks = parsed_extra_networks or ""
 
         self.res_images = []
         self.res_all_prompts = []
@@ -540,6 +663,7 @@ class ScriptRunHandler:
         self.res_info = None
         
         self.sample_every_iteration = 0
+        self.extra_networks = None
 
         self.last_run_prompt = ""
         self.dont_sample_repetitive = dont_sample_repetitive
@@ -548,7 +672,7 @@ class ScriptRunHandler:
         if shared.state.interrupted:
             return False
 
-        run_prompt = normalize_result(prompt) + self.parsed_extra_networks
+        run_prompt = normalize_result(prompt) + (self.extra_networks or "")
 
         if self.dont_sample_repetitive and self.last_run_prompt == run_prompt:
             cols, _ = os.get_terminal_size()
@@ -622,7 +746,12 @@ class Script(scripts.Script):
         gr.HTML("<br />")
         with gr.Row():
             input_type = gr.Radio(label = 'Source', show_label = False,
-                choices = [ VALUE_TYPE_PROMPT, VALUE_TYPE_IMAGE, VALUE_TYPE_IMAGES_BATCH ], value = VALUE_TYPE_PROMPT, elem_id = "pezdispenser_script_input_type")
+                choices = [ VALUE_TYPE_PROMPT, VALUE_TYPE_IMAGE, VALUE_TYPE_IMAGES_BATCH ], value = VALUE_TYPE_PROMPT, 
+                elem_id = "pezdispenser_script_input_type")
+
+        with gr.Row(elem_id = "pezdispenser_script_input_prompt_group", visible = True) as input_prompt_group:
+            input_prompt_split_prompt = gr.Checkbox(label = 'Split prompt by lines', value = False, 
+                elem_id = "pezdispenser_script_input_prompt_split_prompt")
 
         with gr.Row(elem_id = "pezdispenser_script_input_images_group", visible = False) as input_images_group:
             with gr.Column():
@@ -631,19 +760,27 @@ class Script(scripts.Script):
                         with gr.Tab("Image" if i == 0 else f"Extra image {i}"):
                             input_images.append(gr.Image(type = "pil", show_label = False, elem_id = f"pezdispenser_script_input_image_{i}"))
                 with gr.Row():
-                    input_images_use_prompt = gr.Checkbox(label = 'Use prompt', value = False, elem_id = "pezdispenser_script_input_images_use_prompt")
+                    input_images_use_prompt = gr.Checkbox(label = 'Use prompt', value = False, 
+                        elem_id = "pezdispenser_script_input_images_use_prompt")
+                    input_images_split_prompt = gr.Checkbox(label = 'Split prompt by lines', value = False, 
+                        elem_id = "pezdispenser_script_input_images_split_prompt")
 
         with gr.Row(elem_id = "pezdispenser_script_input_images_batch_group", visible = False) as input_images_batch_group:
             with gr.Column():
                 with gr.Row():
-                    input_batch_folder = gr.Textbox(label = "Input directory", lines = 1, max_lines = 1, elem_id = "pezdispenser_script_input_batch_folder")
+                    input_batch_folder = gr.Textbox(label = "Input directory", lines = 1, max_lines = 1, 
+                        elem_id = "pezdispenser_script_input_batch_folder")
                 with gr.Row():
                     with gr.Accordion("Extra images", open = False):
                         for i in range(1, INPUT_IMAGES_COUNT):
                             with gr.Tab(f"Extra image {i}"):
-                                input_batch_images.append(gr.Image(type = "pil", show_label = False, elem_id = f"pezdispenser_script_input_batch_image_{i}"))
+                                input_batch_images.append(gr.Image(type = "pil", show_label = False, 
+                                elem_id = f"pezdispenser_script_input_batch_image_{i}"))
                 with gr.Row():
-                    input_batch_images_use_prompt = gr.Checkbox(label = 'Use prompt', value = False, elem_id = "pezdispenser_script_input_batch_images_use_prompt")
+                    input_batch_images_use_prompt = gr.Checkbox(label = 'Use prompt', value = False, 
+                        elem_id = "pezdispenser_script_input_batch_images_use_prompt")
+                    input_batch_images_split_prompt = gr.Checkbox(label = 'Split prompt by lines', 
+                        value = False, elem_id = "pezdispenser_script_input_batch_images_split_prompt")
 
         gr.HTML("<br />")
         with gr.Row():
@@ -657,36 +794,62 @@ class Script(scripts.Script):
         gr.HTML("<br />")
         with gr.Row(variant="compact"):
             with gr.Column():
-                opt_prompt_length = gr.Slider(label = "Prompt length (optimal 8-16)", minimum = 1, maximum = 75, step = 1, value = args.prompt_len, elem_id = "pezdispenser_script_opt_prompt_length")
-                opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = "pezdispenser_script_opt_num_step")
+                opt_prompt_length = gr.Slider(label = "Prompt length (optimal 8-16)", minimum = 1, maximum = 75, step = 1, 
+                    value = args.prompt_len, elem_id = "pezdispenser_script_opt_prompt_length")
+                opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, 
+                    value = args.iter, elem_id = "pezdispenser_script_opt_num_step")
             with gr.Column():
-                opt_sample_step = gr.Slider(label = "Sample on every step (0 - disabled)", minimum = 0, maximum = 10000, step = 1, value = args.sample_on_iter, elem_id = "pezdispenser_script_opt_sample_step")
-                opt_sample_repetitive = gr.Checkbox(label = "Do not make repetitive samples", value = args.dont_sample_repetitive, elem_id = "pezdispenser_script_opt_sample_repetitive")
+                opt_sample_step = gr.Slider(label = "Sample on every step (0 - disabled)", minimum = 0, maximum = 10000, step = 1, 
+                    value = args.sample_on_iter, elem_id = "pezdispenser_script_opt_sample_step")
+                opt_sample_repetitive = gr.Checkbox(label = "Do not make repetitive samples", value = args.dont_sample_repetitive, 
+                    elem_id = "pezdispenser_script_opt_sample_repetitive")
 
         with gr.Row():
             with gr.Accordion("Advanced", open = False):
                 with gr.Row(variant="compact"):
                     with gr.Column():
-                        opt_lr = gr.Textbox(label = "Learning rate for AdamW optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_lr")
-                        opt_weight_decay = gr.Textbox(label = "Weight decay for AdamW optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_weight_decay")
+                        opt_lr = gr.Textbox(label = "Learning rate for optimizer (default 0.1)", value = args.lr, lines = 1, 
+                            max_lines = 1, elem_id = "pezdispenser_script_opt_lr")
+                        opt_weight_decay = gr.Textbox(label = "Weight decay for optimizer (default 0.1)", value = args.weight_decay, 
+                            lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_weight_decay")
                     with gr.Column():
-                        opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_prompt_bs")
-                        opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_prompt_batch_size")
+                        opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, 
+                            max_lines = 1, elem_id = "pezdispenser_script_opt_prompt_bs")
+                        opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", 
+                            value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_script_opt_prompt_batch_size")
+
+        with gr.Row():
+            with gr.Accordion("Experimental", open = False):
+                with gr.Row(variant="compact"):
+                    with gr.Column():
+                        optimizers_names = [ f"{n} ({d})" for n, d in utils.optimizers.items() ]
+                        args_optimizer = optimizers_names[list(utils.optimizers).index(args.optimizer)] if args.optimizer in utils.optimizers else optimizers_names[0]
+                        opt_optimizer = gr.Dropdown(label = "Optimizer", choices = optimizers_names, type = "index", 
+                            value = args_optimizer, elem_id = "pezdispenser_script_opt_optimizer")
+                        opt_torch_compile_level = gr.Slider(label = "Torch compilation level", 
+                            minimum = utils.TORCH_COMPILE_LEVEL_OFF, maximum = utils.TORCH_COMPILE_LEVEL_MAX, step = 1, 
+                            value = args.torch_compile_level, elem_id = "pezdispenser_script_opt_torch_compile_level")
 
         with gr.Row():
             gr.HTML(f"<br />" + VERSION_HTML)
 
         def input_type_change(t):
+            input_prompt_group.visible = (t == VALUE_TYPE_PROMPT)
             input_images_group.visible = (t == VALUE_TYPE_IMAGE)
             input_images_batch_group.visible = (t == VALUE_TYPE_IMAGES_BATCH)
             return [
+                gr.Row.update(visible = input_prompt_group.visible),
                 gr.Row.update(visible = input_images_group.visible),
                 gr.Row.update(visible = input_images_batch_group.visible),
             ]
         input_type.change(
             fn = input_type_change,
             inputs = [input_type],
-            outputs = [input_images_group, input_images_batch_group]
+            outputs = [
+                input_prompt_group,
+                input_images_group,
+                input_images_batch_group
+            ]
         )
 
         def unload_model_button_click():
@@ -702,8 +865,11 @@ class Script(scripts.Script):
 
         res = [
             input_type,
+            input_prompt_split_prompt,
             input_images_use_prompt,
+            input_images_split_prompt,
             input_batch_images_use_prompt,
+            input_batch_images_split_prompt,
             input_batch_folder,
             opt_model,
             opt_prompt_length,
@@ -713,7 +879,9 @@ class Script(scripts.Script):
             opt_lr,
             opt_weight_decay,
             opt_prompt_bs,
-            opt_batch_size
+            opt_batch_size,
+            opt_optimizer,
+            opt_torch_compile_level
         ] + input_images + input_batch_images
 
         for obj in res:
@@ -723,8 +891,11 @@ class Script(scripts.Script):
 
     def run(self, p,
         input_type,
+        input_prompt_split_prompt,
         input_images_use_prompt,
+        input_images_split_prompt,
         input_batch_images_use_prompt,
+        input_batch_images_split_prompt,
         input_batch_folder,
         model_index,
         prompt_length,
@@ -735,6 +906,8 @@ class Script(scripts.Script):
         weight_decay,
         prompt_bs,
         batch_size,
+        optimizer,
+        torch_compile_level,
         
         *args
     ):
@@ -746,13 +919,28 @@ class Script(scripts.Script):
         if not utils.state.installed:
             raise ModuleNotFoundError("Some required packages are not installed")
 
-        parsed_prompts, parsed_extra_networks = parse_prompt(p.prompt)
+        if (optimizer < 0) or (optimizer >= len(utils.optimizers)):
+            raise ValueError("Unknown optimizer")
+
+        if input_type == VALUE_TYPE_PROMPT:
+            split_prompt = input_prompt_split_prompt
+        elif input_type == VALUE_TYPE_IMAGE:
+            split_prompt = input_images_split_prompt
+        elif input_type == VALUE_TYPE_IMAGES_BATCH:
+            split_prompt = input_batch_images_split_prompt
+        else:
+            split_prompt = False
+        
+        parsed_prompts = [parse_prompt(p)
+            for p in [ s.strip()
+                for s in (p.prompt.rstrip().splitlines() if split_prompt else [ p.prompt.strip() ]) ]]
         
         if input_type == VALUE_TYPE_PROMPT:
-            if parsed_prompts is None:
-                raise RuntimeError("Prompt is empty")
-            
-            jobs = [(parsed_prompts, None, None)]
+            jobs = [(p, e, None, None)
+                for p, e in filter(lambda p: not p[0] is None, parsed_prompts)
+            ]
+            if len(jobs) == 0:
+                raise ValueError("Prompt is empty")
 
         elif input_type == VALUE_TYPE_IMAGE:
             input_images_args = args[0:INPUT_IMAGES_COUNT]
@@ -760,12 +948,10 @@ class Script(scripts.Script):
 
             if input_images is None or len(input_images) == 0:
                 raise ValueError("Input image is empty")
-            
-            jobs = [(
-                parsed_prompts if input_images_use_prompt else None,
-                input_images,
-                None
-            )]
+
+            jobs = [(p, e, input_images, None)
+                for p, e in (parsed_prompts if input_images_use_prompt and (len(parsed_prompts) > 0) else [(None, None)])
+            ]
         
         elif input_type == VALUE_TYPE_IMAGES_BATCH:
             input_batch_images_args = args[INPUT_IMAGES_COUNT:INPUT_IMAGES_COUNT + INPUT_IMAGES_COUNT - 1]
@@ -777,11 +963,10 @@ class Script(scripts.Script):
             if input_image_files is None or len(input_image_files) == 0:
                 raise ValueError("Input directory has no images")
             
-            jobs = [(
-                parsed_prompts if input_batch_images_use_prompt else None,
-                input_batch_images,
-                f
-            ) for f in input_image_files]
+            jobs = [(p, e, input_batch_images, f)
+                for f in input_image_files
+                for p, e in (parsed_prompts if input_batch_images_use_prompt and (len(parsed_prompts) > 0) else [(None, None)])
+            ]
                 
         iterations_count_norm = int(iterations_count) if iterations_count is not None else 1000
         prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
@@ -794,7 +979,7 @@ class Script(scripts.Script):
         model, preprocess, clip_model = load_model(model_index, device_name)
         shared.state.textinfo = saved_textinfo
 
-        run_handler = ScriptRunHandler(p, parsed_extra_networks, dont_sample_repetitive)
+        run_handler = ScriptRunHandler(p, dont_sample_repetitive)
 
         progress_steps = [ max(iterations_count_norm // 100, 10) ]
         if (sample_every_iteration > 0) and (sample_every_iteration < iterations_count_norm):
@@ -802,12 +987,14 @@ class Script(scripts.Script):
             run_handler.sample_every_iteration = sample_every_iteration
             shared.state.job_count *= (((iterations_count_norm - 1) // sample_every_iteration) + 1)
 
-        for prompts, images, image_file in jobs:
+        for prompts, extra_networks, images, image_file in jobs:
             if shared.state.interrupted:
                 break
 
+            run_handler.extra_networks = extra_networks
+
             target_prompts = prompts
-            target_images = images
+            target_images = list()
 
             if input_type == VALUE_TYPE_PROMPT:
                 progress_title = "Processing prompt"
@@ -816,12 +1003,15 @@ class Script(scripts.Script):
             elif input_type == VALUE_TYPE_IMAGES_BATCH:
                 progress_title = f"Processing file {image_file}"
                 try:
-                    target_images = [Image.open(os.path.join(input_batch_folder, image_file))] + [i.copy() for i in images]
+                    target_images.append(Image.open(os.path.join(input_batch_folder, image_file)))
                 except Exception as ex:
                     print()
                     print(f"{ex.__class__.__name__}: {ex}")
                     continue
-            
+
+            if not images is None:
+                target_images.extend([i.copy() for i in images])
+
             try:
                 for iteration in range(p.n_iter):
                     if shared.state.interrupted:
@@ -847,7 +1037,9 @@ class Script(scripts.Script):
                         target_prompts = target_prompts,
                         on_progress = on_script_progress,
                         progress_steps = progress_steps,
-                        progress_args = run_handler
+                        progress_args = run_handler,
+                        optimizer = list(utils.optimizers)[optimizer],
+                        torch_compile_level = torch_compile_level
                     )
 
                     shared.state.textinfo = saved_textinfo

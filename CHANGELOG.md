@@ -1,3 +1,11 @@
+## 1.6.0
+
+### Features:
+ * Ability to split prompt by lines
+ * Experimental: Ability to use different optimizers
+ * Experimental: Torch compilation level. 0 - disabled, 1 - default, 2 - max-autotune-no-cudagraphs, 3 - max-autotune. Requires Triton and external C++ compiler. May speed up processing by 2-3 times. May crash WebUI or cause large GPU memory usage.
+
+
 ## 1.5.0
 
 ### Features:
