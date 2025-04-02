@@ -1,7 +1,7 @@
 ## 1.6.1
 
 ### Features:
- * Experimental: Model precision selection. fp32 - default, fp16/bf16 - use olmost 2x less memory and increase processing speed up to 1.5x without without noticeable quality loss.
+ * Experimental: Model precision selection. fp32 - default, fp16/bf16 - use almost 2x less memory and increase processing speed up to 1.5x without without noticeable quality loss.
 
 
 ## 1.6.0
