@@ -1,8 +1,14 @@
+## 1.6.1
+
+### Features:
+ * Experimental: Model precision selection. fp32 - default, fp16/bf16 - use olmost 2x less memory and increase processing speed up to 1.5x without without noticeable quality loss.
+
+
 ## 1.6.0
 
 ### Features:
  * Ability to split prompt by lines
- * Experimental: Ability to use different optimizers
+ * Experimental: Optimizer selection
  * Experimental: Torch compilation level. 0 - disabled, 1 - default, 2 - max-autotune-no-cudagraphs, 3 - max-autotune. Requires Triton and external C++ compiler. May speed up processing by 2-3 times. May crash WebUI or cause large GPU memory usage.
 
 

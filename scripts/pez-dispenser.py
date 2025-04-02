@@ -7,15 +7,16 @@ import argparse
 import traceback
 import torch
 import open_clip
+import gc
 import gradio as gr
 import scripts.optim_utils as utils
-from modules import devices, scripts, script_callbacks, ui, shared, progress, extra_networks
+from modules import devices, scripts, script_callbacks, ui, shared, progress, extra_networks, patches
 from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -32,16 +33,17 @@ class ThisState:
 
     def start_progress(self, title):
         self.progress_title = title
-        self.progress_started = time.time()
+        self.progress_started = time.perf_counter()
 
     def reset(self):
         self.model_index = 0
         self.model_device_name = devices.get_optimal_device_name()
         self.model = None
         self.preprocess = None
+        self.precision = "fp32"
         self.clip_model = None
         self.progress_title = ""
-        self.progress_started = time.time()
+        self.progress_started = time.perf_counter()
 
 this = ThisState()
 
@@ -68,12 +70,16 @@ args.__dict__.update(json.loads("""
     "sample_on_iter": 0,
     "dont_sample_repetitive": false,
     "optimizer": "AdamW",
-    "torch_compile_level": 0
+    "torch_compile_level": 0,
+    "precision": "fp32",
+    "debug": false
 }
 """))
 if os.path.isfile(config_file_path):
     with open(config_file_path, encoding='utf-8') as f:
         args.__dict__.update(json.load(f))
+
+DEBUG = args.debug
 
 def show_tab():
     try:
@@ -86,6 +92,21 @@ def show_script():
         return shared.opts.pezdispenser_ui_mode in [ "Tab and Script", "Script only" ]
     except:
         return True
+
+########## Utils ##########
+
+def optimize_prompt(*args, **kwargs):
+    optimize_started = time.perf_counter()
+    res = utils.optimize_prompt(*args, **kwargs)
+    optimize_time = time.perf_counter() - optimize_started
+    if DEBUG:
+        cols, _ = os.get_terminal_size()
+        print("\r", end = "", flush = True)
+        print(" " * cols, end = "", flush = True)
+        print(f"\rOptimized in {optimize_time:.3f} sec", flush = True)
+    gc.collect()
+    torch.cuda.empty_cache()
+    return res
 
 ########## Devices ##########
 
@@ -165,19 +186,23 @@ def unload_model():
     if not this.preprocess is None:
         del this.preprocess
         this.preprocess = None
+    this.precision = "fp32";
     
     if is_cpu:
         msg = "Model unloaded"
     else:
-        memory_freed = memory_used_pre - torch.cuda.memory_allocated(device)
+        memory_used = torch.cuda.memory_allocated(device)
+        memory_freed = memory_used_pre - memory_used
         msg = f"Model unloaded, GPU memory freed: {(memory_freed / 1048576):.2f} MB"
+        if DEBUG:
+            msg += f", total GPU memory used: {(memory_used / 1048576):.2f} MB"
 
     print(msg)
     return msg
 
 
-def load_model(index, device_name):
-    if this.model is None or this.preprocess is None or this.model_index != index or this.model_device_name != device_name:
+def load_model(index, device_name, precision):
+    if this.model is None or this.preprocess is None or this.model_index != index or this.model_device_name != device_name or this.precision != precision:
         _, clip_model, clip_pretrain = pretrained_models[index];
 
         unload_model()
@@ -189,19 +214,16 @@ def load_model(index, device_name):
         if not is_cpu:
             memory_used_pre = torch.cuda.memory_allocated(device)
 
-        model, _, preprocess = open_clip.create_model_and_transforms(clip_model, pretrained = clip_pretrain, device = device)
-
-        ## experimental torch.compile()
-        #if not utils.torch_compile_mode is None:
-        #    try:
-        #        compiled_model = torch.compile(model, mode = utils.torch_compile_mode)
-        #        del model
-        #        model = compiled_model
-        #    except:
-        #        pass
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            clip_model,
+            pretrained = clip_pretrain,
+            device = device,
+            precision = precision
+        )
 
         this.model = model
         this.preprocess = preprocess
+        this.precision = precision
         this.clip_model = clip_model
         this.model_index = index
         this.model_device_name = device_name
@@ -209,12 +231,17 @@ def load_model(index, device_name):
         if is_cpu:
             print("Model loaded")
         else:
-            memory_taken = torch.cuda.memory_allocated(device) - memory_used_pre
-            print(f"Model loaded, GPU memory taken: {(memory_taken / 1048576):.2f} MB")
+            memory_used = torch.cuda.memory_allocated(device)
+            memory_taken = memory_used - memory_used_pre
+            msg = f"Model loaded, GPU memory taken: {(memory_taken / 1048576):.2f} MB"
+            if DEBUG:
+                msg += f", total GPU memory used: {(memory_used / 1048576):.2f} MB"
+            print(msg)
 
     return this.model, this.preprocess, this.clip_model
 
 def on_ui_reload():
+    utils.reset_forward_text_embedding_compiled()
     unload_model()
 
 script_callbacks.on_before_reload(on_ui_reload)
@@ -251,11 +278,11 @@ def normalize_result(prompt):
 
 def on_progress(step, total, prompt, progress_args):
     if step == 0:
-        this.progress_started = time.time()
+        this.progress_started = time.perf_counter()
 
     progress = step * 100 // total
 
-    processing_time = time.time() - this.progress_started
+    processing_time = time.perf_counter() - this.progress_started
     speed = (step / processing_time) if processing_time > 0 else 0
 
     print(f"\r{this.progress_title}: {progress}% ({speed:.2f}it/s)", end = "", flush = True)
@@ -275,6 +302,7 @@ def inference(
     batch_size, 
     optimizer,
     torch_compile_level,
+    precision,
     target_images = None, 
     target_prompt = None
 ):
@@ -299,19 +327,42 @@ def inference(
             raise ValueError("Nothing to process")
 
         device_name = available_devices[device_name_index][0] if ALLOW_DEVICE_SELECTION else this.model_device_name
+        device = torch.device(device_name)
 
         shared.state.textinfo = "Loading model..."
-        model, preprocess, clip_model = load_model(model_index, device_name)
+        model, preprocess, clip_model = load_model(model_index, device_name, precision)
+
+        if torch_compile_level > 0:
+            shared.state.textinfo = "Warm up model..."
+            if DEBUG:
+                print("Warm up model with short optimization cycle")
+            optimize_prompt(
+                model,
+                preprocess,
+                device,
+                clip_model,
+                5,
+                2,
+                float(lr),
+                float(weight_decay),
+                1,
+                None,
+                1,
+                target_images = None,
+                target_prompts = ["sample"],
+                optimizer = list(utils.optimizers)[optimizer],
+                torch_compile_level = torch_compile_level
+            )
 
         prompt_len = min(int(prompt_length), 75) if prompt_length is not None else 8
         iter = int(iterations_count) if iterations_count is not None else 1000
 
         shared.state.textinfo = "Processing..."
 
-        optimized_prompt = utils.optimize_prompt(
+        optimized_prompt = optimize_prompt(
             model,
             preprocess,
-            torch.device(device_name),
+            device,
             clip_model,
             prompt_len,
             iter,
@@ -330,7 +381,7 @@ def inference(
         optimized_prompt = normalize_result(optimized_prompt)
 
         print("")
-        processing_time = time.time() - shared.state.time_start
+        processing_time = time.perf_counter() - shared.state.time_start
         res = optimized_prompt + parsed_extra_networks, f"Time taken: {processing_time:.2f} sec"
 
     except Exception as ex:
@@ -359,6 +410,7 @@ def inference_image(
     batch_size, 
     optimizer,
     torch_compile_level,
+    precision,
     *target_images
 ):
     this.start_progress("Processing image")
@@ -374,6 +426,7 @@ def inference_image(
         batch_size, 
         optimizer,
         torch_compile_level,
+        precision,
         target_images = target_images
     )
 
@@ -389,6 +442,7 @@ def inference_text(
     batch_size, 
     optimizer,
     torch_compile_level,
+    precision,
     target_prompt
 ):
     this.start_progress("Processing prompt")
@@ -404,6 +458,7 @@ def inference_text(
         batch_size, 
         optimizer,
         torch_compile_level,
+        precision,
         target_prompt = target_prompt if not target_prompt is None and target_prompt != "" else None
     )
 
@@ -490,19 +545,25 @@ def create_tab():
 
                 with gr.Row():
                     with gr.Column():
-                        opt_prompt_length = gr.Slider(label = "Prompt length (optimal 8-16)", minimum = 1, maximum = 75, step = 1, value = args.prompt_len, elem_id = "pezdispenser_opt_prompt_length")
+                        opt_prompt_length = gr.Slider(label = "Prompt length (optimal 8-16)", minimum = 1, maximum = 75, step = 1, 
+                            value = args.prompt_len, elem_id = "pezdispenser_opt_prompt_length")
                     with gr.Column():
-                        opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, value = args.iter, elem_id = "pezdispenser_opt_num_step")
+                        opt_num_step = gr.Slider(label = "Optimization steps (optimal 1000-3000)", minimum = 1, maximum = 10000, step = 1, 
+                            value = args.iter, elem_id = "pezdispenser_opt_num_step")
 
                 with gr.Row():
                     with gr.Accordion("Advanced", open = False):
                         with gr.Row(variant="compact"):
                             with gr.Column():
-                                opt_lr = gr.Textbox(label = "Learning rate for optimizer (default 0.1)", value = args.lr, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_lr")
-                                opt_weight_decay = gr.Textbox(label = "Weight decay for optimizer (default 0.1)", value = args.weight_decay, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_weight_decay")
+                                opt_lr = gr.Textbox(label = "Learning rate for optimizer (default 0.1)", value = args.lr, lines = 1, 
+                                    max_lines = 1, elem_id = "pezdispenser_opt_lr")
+                                opt_weight_decay = gr.Textbox(label = "Weight decay for optimizer (default 0.1)", value = args.weight_decay, 
+                                    lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_weight_decay")
                             with gr.Column():
-                                opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_bs")
-                                opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_batch_size")
+                                opt_prompt_bs = gr.Textbox(label = "Number of initializations (default 1)", value = args.prompt_bs, 
+                                    lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_bs")
+                                opt_batch_size = gr.Textbox(label = "Number of target images/prompts used for each iteration (default 1)", 
+                                    value = args.batch_size, lines = 1, max_lines = 1, elem_id = "pezdispenser_opt_prompt_batch_size")
 
                 with gr.Row():
                     with gr.Accordion("Experimental", open = False):
@@ -511,10 +572,12 @@ def create_tab():
                                 optimizers_names = [ f"{n} ({d})" for n, d in utils.optimizers.items() ]
                                 args_optimizer = optimizers_names[list(utils.optimizers).index(args.optimizer)] if args.optimizer in utils.optimizers else optimizers_names[0]
                                 opt_optimizer = gr.Dropdown(label = "Optimizer", choices = optimizers_names, type = "index", 
-                                    value = args_optimizer, elem_id = "pezdispenser_script_opt_optimizer")
+                                    value = args_optimizer, elem_id = "pezdispenser_opt_optimizer")
                                 opt_torch_compile_level = gr.Slider(label = "Torch compilation level", 
                                     minimum = utils.TORCH_COMPILE_LEVEL_OFF, maximum = utils.TORCH_COMPILE_LEVEL_MAX, step = 1, 
-                                    value = args.torch_compile_level, elem_id = "pezdispenser_script_opt_torch_compile_level")
+                                    value = args.torch_compile_level, elem_id = "pezdispenser_opt_torch_compile_level")
+                                opt_precision = gr.Dropdown(label = "Precision", choices = ["fp32", "fp16", "bf16"], 
+                                    value = args.precision, elem_id = "pezdispenser_opt_precision")
 
                 with gr.Row():
                     gr.HTML(VERSION_HTML)
@@ -562,6 +625,7 @@ def create_tab():
                 opt_batch_size,
                 opt_optimizer,
                 opt_torch_compile_level,
+                opt_precision
             ] + input_images,
             outputs = [output_prompt, statistics_text]
         )
@@ -580,6 +644,7 @@ def create_tab():
                 opt_batch_size, 
                 opt_optimizer,
                 opt_torch_compile_level,
+                opt_precision,
                 input_text
             ],
             outputs = [output_prompt, statistics_text]
@@ -611,6 +676,7 @@ def create_tab():
         opt_batch_size,
         opt_optimizer,
         opt_torch_compile_level,
+        opt_precision,
         input_text,
     ] + input_images:
         setattr(obj, "do_not_save_to_config", True)
@@ -702,9 +768,9 @@ class ScriptRunHandler:
 
 def on_script_progress(step, total, prompt, run_handler):
     if step == 0:
-        this.progress_started = time.time()
+        this.progress_started = time.perf_counter()
     progress = step * 100 // total
-    processing_time = time.time() - this.progress_started
+    processing_time = time.perf_counter() - this.progress_started
     speed = (step / processing_time) if processing_time > 0 else 0
     shared.state.textinfo = f"{this.progress_title} {progress}% ..."
     print(f"\r{this.progress_title}: {progress}% ({speed:.2f}it/s)", end = "", flush = True)
@@ -829,6 +895,8 @@ class Script(scripts.Script):
                         opt_torch_compile_level = gr.Slider(label = "Torch compilation level", 
                             minimum = utils.TORCH_COMPILE_LEVEL_OFF, maximum = utils.TORCH_COMPILE_LEVEL_MAX, step = 1, 
                             value = args.torch_compile_level, elem_id = "pezdispenser_script_opt_torch_compile_level")
+                        opt_precision = gr.Dropdown(label = "Precision", choices = ["fp32", "fp16", "bf16"], 
+                            value = args.precision, elem_id = "pezdispenser_script_opt_precision")
 
         with gr.Row():
             gr.HTML(f"<br />" + VERSION_HTML)
@@ -881,7 +949,8 @@ class Script(scripts.Script):
             opt_prompt_bs,
             opt_batch_size,
             opt_optimizer,
-            opt_torch_compile_level
+            opt_torch_compile_level,
+            opt_precision
         ] + input_images + input_batch_images
 
         for obj in res:
@@ -908,6 +977,7 @@ class Script(scripts.Script):
         batch_size,
         optimizer,
         torch_compile_level,
+        precision,
         
         *args
     ):
@@ -974,9 +1044,35 @@ class Script(scripts.Script):
         shared.state.job_count = len(jobs) * p.n_iter
 
         saved_textinfo = shared.state.textinfo
+        
         shared.state.textinfo = "Loading model..."
         device_name = devices.get_optimal_device_name()
-        model, preprocess, clip_model = load_model(model_index, device_name)
+        device = torch.device(device_name)
+        is_cpu = device_name == "cpu"
+        model, preprocess, clip_model = load_model(model_index, device_name, precision)
+
+        if torch_compile_level > 0:
+            shared.state.textinfo = "Warm up model..."
+            if DEBUG:
+                print("Warm up model with short optimization cycle")
+            optimize_prompt(
+                model,
+                preprocess,
+                device,
+                clip_model,
+                5,
+                2,
+                float(lr),
+                float(weight_decay),
+                1,
+                None,
+                1,
+                target_images = None,
+                target_prompts = ["sample"],
+                optimizer = list(utils.optimizers)[optimizer],
+                torch_compile_level = torch_compile_level
+            )
+        
         shared.state.textinfo = saved_textinfo
 
         run_handler = ScriptRunHandler(p, dont_sample_repetitive)
@@ -1017,14 +1113,21 @@ class Script(scripts.Script):
                     if shared.state.interrupted:
                         break
                     
+                    if DEBUG:
+                        msg = f"{progress_title}, iteration {iteration + 1} of {p.n_iter}, images: {len(target_images)}, prompts: {target_prompts}"
+                        if not is_cpu:
+                            memory_used = torch.cuda.memory_allocated(device)
+                            msg += f", total GPU memory used: {(memory_used / 1048576):.2f} MB"
+                        print(msg)
+
                     this.start_progress(progress_title)
                     saved_textinfo = shared.state.textinfo
                     shared.state.textinfo = this.progress_title + "..."
                     
-                    optimized_prompt = utils.optimize_prompt(
+                    optimized_prompt = optimize_prompt(
                         model,
                         preprocess,
-                        torch.device(device_name),
+                        device,
                         clip_model,
                         prompt_len,
                         iterations_count_norm,

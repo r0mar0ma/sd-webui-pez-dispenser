@@ -240,7 +240,8 @@ def get_target_feature_images(model, preprocess, device, target_images):
     with torch.no_grad():
         curr_images = [preprocess(i).unsqueeze(0) for i in target_images]
         curr_images = torch.concatenate(curr_images).to(device)
-        all_target_features = model.encode_image(curr_images)
+        cast_dtype = model.transformer.get_cast_dtype()
+        all_target_features = model.encode_image(curr_images.to(cast_dtype))
 
     return all_target_features
 
@@ -299,35 +300,50 @@ def initialize_prompt(tokenizer, token_embedding, device, prompt_len, prompt_bs)
 #
 #    return x
 #
-#encode_text_embedding = torch.compile(encode_text_embedding, mode = "max-autotune", backend = torch_compile_backend)
+#def forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
+#    text_features = encode_text_embedding(model, embeddings, ids, avg_text=avg_text)
+#    if return_feature:
+#        return text_features
+#
+#    # normalized features
+#    image_features = image_features / image_features.norm(dim=1, keepdim=True)
+#    text_features = text_features / text_features.norm(dim=1, keepdim=True)
+#
+#    # cosine similarity as logits
+#    # logit_scale = model.logit_scale.exp()
+#    logits_per_image = image_features @ text_features.t()
+#    logits_per_text = logits_per_image.t()
+#
+#    # shape = [global_batch_size, global_batch_size]
+#    return logits_per_image, logits_per_text
     
-def _forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
-
-    ##### def encode_text_embedding(model, embeddings, ids, avg_text=False):
+def _forward_text_embedding(model, embeddings, ids, image_features):
     cast_dtype = model.transformer.get_cast_dtype()
 
-    x = embeddings + model.positional_embedding.to(cast_dtype)
+    x = embeddings.to(cast_dtype) + model.positional_embedding.to(cast_dtype)
     x = x.permute(1, 0, 2)  # NLD -> LND
     x = model.transformer(x, attn_mask=model.attn_mask)
     x = x.permute(1, 0, 2)  # LND -> NLD
     x = model.ln_final(x)
 
+    # Optimized for CUDA graphs
+    batch_size, seq_len, embed_dim = x.shape
+    max_indices = ids.argmax(dim=-1)
+    gather_indices = max_indices.reshape(batch_size, 1, 1).expand(-1, -1, embed_dim)
+    extracted_features = torch.gather(x, dim=1, index=gather_indices).squeeze(1)
+    e = extracted_features @ model.text_projection
+
+    """
+    # Original code
     # x.shape = [batch_size, n_ctx, transformer.width]
     # take features from the eot embedding (eot_token is the highest number in each sequence)
-    if avg_text:
-        x = x[torch.arange(x.shape[0]), :ids.argmax(dim=-1)]
-        x[:, 1:-1]
-        x = x.mean(dim=1) @ model.text_projection
-    else:
-        x = x[torch.arange(x.shape[0]), ids.argmax(dim=-1)] @ model.text_projection
+    x = x[torch.arange(x.shape[0]), ids.argmax(dim=-1)] @ model.text_projection
+
+    assert torch.allclose(x, e)
 
     text_features = x
-    #####
-    #text_features = encode_text_embedding(model, embeddings, ids, avg_text=avg_text)
-    #####
-
-    if return_feature:
-        return text_features
+    """
+    text_features = e
 
     # normalized features
     image_features = image_features / image_features.norm(dim=1, keepdim=True)
@@ -341,22 +357,22 @@ def _forward_text_embedding(model, embeddings, ids, image_features, avg_text=Fal
     # shape = [global_batch_size, global_batch_size]
     return logits_per_image, logits_per_text
 
-_forward_text_embedding_compiled_level = 0
 _forward_text_embedding_compiled = None
+_forward_text_embedding_compiled_level = 0
 _forward_text_embedding_compiled_valid = False
 _forward_text_embedding_compiled_cuda = False
 
-def forward_text_embedding(model, embeddings, ids, image_features, avg_text=False, return_feature=False):
+def forward_text_embedding(model, embeddings, ids, image_features):
     global _forward_text_embedding_compiled_valid
     if _forward_text_embedding_compiled_valid:
         try:
             if _forward_text_embedding_compiled_cuda:
                 torch.compiler.cudagraph_mark_step_begin()
-            return _forward_text_embedding_compiled(model, embeddings, ids, image_features, avg_text, return_feature)
+            return _forward_text_embedding_compiled(model, embeddings, ids, image_features)
         except Exception as e:
             print(f"Unable to use compiled forward_text_embedding(), reverting to plain one: {e}")
             _forward_text_embedding_compiled_valid = False
-    return _forward_text_embedding(model, embeddings, ids, image_features, avg_text, return_feature)
+    return _forward_text_embedding(model, embeddings, ids, image_features)
 
 def get_torch_compile_mode(torch_compile_level):
     if torch_compile_level <= 1:
@@ -366,29 +382,44 @@ def get_torch_compile_mode(torch_compile_level):
     else:
         return "max-autotune"
 
-def init_forward_text_embedding(torch_compile_level=0):
-    global _forward_text_embedding_compiled_level
+def reset_forward_text_embedding_compiled():
     global _forward_text_embedding_compiled
+    global _forward_text_embedding_compiled_level
     global _forward_text_embedding_compiled_valid
     global _forward_text_embedding_compiled_cuda
+    
+    _forward_text_embedding_compiled = None
+    _forward_text_embedding_compiled_level = 0
+    _forward_text_embedding_compiled_valid = False
+    _forward_text_embedding_compiled_cuda = False
+    
+    try:
+        torch._dynamo.reset()
+    except:
+        pass
+
+def init_forward_text_embedding(torch_compile_level=0):
+    global _forward_text_embedding_compiled
+    global _forward_text_embedding_compiled_level
+    global _forward_text_embedding_compiled_valid
+    global _forward_text_embedding_compiled_cuda
+
     if torch_compile_level <= 0:
-        _forward_text_embedding_compiled = None
-        _forward_text_embedding_compiled_valid = False
-        _forward_text_embedding_compiled_cuda = False
+        reset_forward_text_embedding_compiled()
     else:
+        if _forward_text_embedding_compiled_level != torch_compile_level:
+            reset_forward_text_embedding_compiled()
+            _forward_text_embedding_compiled = torch.compile(_forward_text_embedding, mode = get_torch_compile_mode(torch_compile_level))
+            _forward_text_embedding_compiled_level = torch_compile_level
+
+        _forward_text_embedding_compiled_valid = True
+
         if torch_compile_level == 1:
-            _forward_text_embedding_compiled_valid = True
             _forward_text_embedding_compiled_cuda = False
         elif torch_compile_level == 2:
-            _forward_text_embedding_compiled_valid = True
             _forward_text_embedding_compiled_cuda = False
         else:
-            _forward_text_embedding_compiled_valid = True
             _forward_text_embedding_compiled_cuda = True
-
-        if _forward_text_embedding_compiled_level != torch_compile_level:
-           _forward_text_embedding_compiled_level = torch_compile_level
-           _forward_text_embedding_compiled = torch.compile(_forward_text_embedding, mode = get_torch_compile_mode(torch_compile_level))
 
 
 
@@ -530,9 +561,9 @@ def optimize_prompt(
     # get target features
     image_target_features = None
     text_target_features = None
-    if not target_images is None:
+    if (not target_images is None) and (len(target_images) > 0):
         image_target_features = get_target_feature_images(model, preprocess, device, target_images)
-    if not target_prompts is None:
+    if (not target_prompts is None) and (len(target_prompts) > 0):
         tokenizer_funct = open_clip.get_tokenizer(clip_model)
         text_target_features = get_target_feature_prompts(model, tokenizer_funct, device, target_prompts)
 
