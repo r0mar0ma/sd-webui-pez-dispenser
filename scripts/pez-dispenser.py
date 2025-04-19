@@ -16,7 +16,7 @@ from modules.ui_components import ToolButton
 from PIL import Image
 
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -95,6 +95,10 @@ def show_script():
 
 ########## Utils ##########
 
+def gc_collect():
+    gc.collect()
+    torch.cuda.empty_cache()
+
 def optimize_prompt(*args, **kwargs):
     optimize_started = time.perf_counter()
     res = utils.optimize_prompt(*args, **kwargs)
@@ -104,8 +108,7 @@ def optimize_prompt(*args, **kwargs):
         print("\r", end = "", flush = True)
         print(" " * cols, end = "", flush = True)
         print(f"\rOptimized in {optimize_time:.3f} sec", flush = True)
-    gc.collect()
-    torch.cuda.empty_cache()
+    gc_collect()
     return res
 
 ########## Devices ##########
@@ -180,6 +183,8 @@ def unload_model():
     if not is_cpu:
         memory_used_pre = torch.cuda.memory_allocated(device)
 
+    gc_collect()
+
     if not this.model is None:
         del this.model
         this.model = None
@@ -188,6 +193,8 @@ def unload_model():
         this.preprocess = None
     this.precision = "fp32";
     
+    gc_collect()
+
     if is_cpu:
         msg = "Model unloaded"
     else:
@@ -209,6 +216,8 @@ def load_model(index, device_name, precision):
 
         print(f"Loading model: {clip_model}:{clip_pretrain}, device: {get_device_display_name(device_name)}")
 
+        gc_collect()
+        
         is_cpu = device_name == "cpu"
         device = torch.device(device_name)
         if not is_cpu:
@@ -227,6 +236,8 @@ def load_model(index, device_name, precision):
         this.clip_model = clip_model
         this.model_index = index
         this.model_device_name = device_name
+
+        gc_collect()
 
         if is_cpu:
             print("Model loaded")

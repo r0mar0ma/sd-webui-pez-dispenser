@@ -1,3 +1,9 @@
+## 1.6.2
+
+### Features:
+ * Additional memory cleanup
+
+
 ## 1.6.1
 
 ### Features:
