@@ -1,3 +1,9 @@
+## 1.6.3
+
+### Features:
+ * Small optimization for torch compilation.
+
+
 ## 1.6.2
 
 ### Features:

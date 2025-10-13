@@ -15,8 +15,7 @@ from modules.processing import process_images, Processed
 from modules.ui_components import ToolButton
 from PIL import Image
 
-
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 
 ALLOW_DEVICE_SELECTION = False
 INPUT_IMAGES_COUNT = 5
@@ -149,6 +148,11 @@ if not "metaclip_fullcc" in open_clip.pretrained._VITbigG14:
         #quick_gelu=True,
     )
 
+allowed_precisions = [
+    "fp32",
+    "fp16",
+    "bf16",
+]
 
 allowed_models = [
     r"^RN[0-9]+",
@@ -229,7 +233,12 @@ def load_model(index, device_name, precision):
             device = device,
             precision = precision
         )
+        model = model.eval()
 
+        #if not is_cpu and hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        #    torch.backends.cuda.enable_flash_sdp(True)
+        #    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    
         this.model = model
         this.preprocess = preprocess
         this.precision = precision
@@ -587,7 +596,7 @@ def create_tab():
                                 opt_torch_compile_level = gr.Slider(label = "Torch compilation level", 
                                     minimum = utils.TORCH_COMPILE_LEVEL_OFF, maximum = utils.TORCH_COMPILE_LEVEL_MAX, step = 1, 
                                     value = args.torch_compile_level, elem_id = "pezdispenser_opt_torch_compile_level")
-                                opt_precision = gr.Dropdown(label = "Precision", choices = ["fp32", "fp16", "bf16"], 
+                                opt_precision = gr.Dropdown(label = "Precision", choices = allowed_precisions, 
                                     value = args.precision, elem_id = "pezdispenser_opt_precision")
 
                 with gr.Row():
@@ -906,7 +915,7 @@ class Script(scripts.Script):
                         opt_torch_compile_level = gr.Slider(label = "Torch compilation level", 
                             minimum = utils.TORCH_COMPILE_LEVEL_OFF, maximum = utils.TORCH_COMPILE_LEVEL_MAX, step = 1, 
                             value = args.torch_compile_level, elem_id = "pezdispenser_script_opt_torch_compile_level")
-                        opt_precision = gr.Dropdown(label = "Precision", choices = ["fp32", "fp16", "bf16"], 
+                        opt_precision = gr.Dropdown(label = "Precision", choices = allowed_precisions, 
                             value = args.precision, elem_id = "pezdispenser_script_opt_precision")
 
         with gr.Row():

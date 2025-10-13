@@ -3,35 +3,31 @@ import copy
 import open_clip
 import torch
 
-try:
-    from transformers.optimization import Adafactor
-except:
-    pass
-
 from modules import shared
+
 
 TORCH_COMPILE_LEVEL_OFF = 0
 TORCH_COMPILE_LEVEL_MAX = 3
 
+
 optimizers = {
     "AdamW": "Default",
+    "AdamW-fused": "Optimized",
     "Lion": "Generally faster",
     "SGD": "Simpler calculations per step, slightly higher lr",
-    "Adafactor": "Less memory, faster for large models"
 }
+
+try:
+    from transformers.optimization import Adafactor
+    optimizers["Adafactor"] = "Less memory, faster for large models"
+except:
+    pass
+
 
 class State:
     installed = False
 
 state = State()
-
-##################################################
-#try:
-#    from sentence_transformers.util import (semantic_search, dot_score, normalize_embeddings)
-#    state.installed = True
-#except:
-#    print("pez-dispenser error: No sentence_transformers package installed")
-##################################################
 
 import torch
 from torch import Tensor, device
@@ -143,12 +139,6 @@ def dot_score(a: Tensor, b: Tensor):
 
     return torch.mm(a, b.transpose(0, 1))
 
-def normalize_embeddings(embeddings: Tensor):
-    """
-    Normalizes the embeddings matrix, so that each sentence embedding has unit length
-    """
-    return torch.nn.functional.normalize(embeddings, p=2, dim=1)
-
 ##################################################
 
 # Simple Lion optimizer implementation
@@ -187,36 +177,55 @@ class Lion(torch.optim.Optimizer):
 
 ##################################################
 
-def nn_project(curr_embeds, embedding_layer, print_hits=False):
-    with torch.no_grad():
-        bsz,seq_len,emb_dim = curr_embeds.shape
-        
-        # Using the sentence transformers semantic search which is 
-        # a dot product exact kNN search between a set of 
-        # query vectors and a corpus of vectors
-        curr_embeds = curr_embeds.reshape((-1,emb_dim))
-        curr_embeds = normalize_embeddings(curr_embeds) # queries
+"""
+def nn_project(curr_embeds, embedding_matrix_normalized):
+    bsz,seq_len,emb_dim = curr_embeds.shape
 
-        embedding_matrix = embedding_layer.weight
-        embedding_matrix = normalize_embeddings(embedding_matrix)
-        
-        hits = semantic_search(curr_embeds, embedding_matrix, 
-                                query_chunk_size=curr_embeds.shape[0], 
-                                top_k=1,
-                                score_function=dot_score)
+    # Using the sentence transformers semantic search which is 
+    # a dot product exact kNN search between a set of 
+    # query vectors and a corpus of vectors
+    curr_embeds = curr_embeds.reshape(-1, emb_dim)
 
-        #if print_hits:
-        #    all_hits = []
-        #    for hit in hits:
-        #        all_hits.append(hit[0]["score"])
-        #    print(f"mean hits:{mean(all_hits)}")
-        
-        nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
-        nn_indices = nn_indices.reshape((bsz,seq_len))
+    curr_embeds = torch.nn.functional.normalize(curr_embeds, p=2, dim=1)
 
-        projected_embeds = embedding_layer(nn_indices)
+    " ""
+    hits = semantic_search(curr_embeds, embedding_matrix_normalized, 
+                            query_chunk_size=curr_embeds.shape[0], 
+                            top_k=1,
+                            score_function=dot_score)
+    nn_indices = torch.tensor([hit[0]["corpus_id"] for hit in hits], device=curr_embeds.device)
+    nn_indices = nn_indices.reshape((bsz,seq_len))
+    " ""
+    # Direct matrix multiplication instead of semantic_search
+    scores = torch.mm(curr_embeds, embedding_matrix_normalized.t())
+    nn_indices = scores.argmax(dim=1)
+    nn_indices = nn_indices.reshape(bsz, seq_len)
 
-    return projected_embeds, nn_indices
+    return nn_indices
+"""
+
+def nn_project(curr_embeds, embedding_matrix_normalized):
+    bsz, seq_len, emb_dim = curr_embeds.shape
+    
+    # Reshape and normalize in one go
+    curr_embeds_flat = torch.nn.functional.normalize(
+        curr_embeds.view(-1, emb_dim), 
+        p=2, 
+        dim=1
+    )
+    
+    # Single matrix multiplication for all similarities
+    similarities = torch.mm(curr_embeds_flat, embedding_matrix_normalized.t())
+    
+    # Get top-1 indices directly
+    nn_indices = similarities.argmax(dim=1)
+    
+    # Reshape back
+    nn_indices = nn_indices.view(bsz, seq_len)
+    
+    return nn_indices
+
+#nn_project = torch.compile(nn_project, mode = "max-autotune")
 
 def decode_ids(input_ids, tokenizer, by_token=False):
     input_ids = input_ids.detach().cpu().numpy()
@@ -445,28 +454,40 @@ def optimize_prompt_loop(
     p_bs, p_len, p_dim = prompt_embeds.shape
 
     # get optimizer
+    input_optimizer = None
     if optimizer == "AdamW":
         input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay)
+    elif optimizer == "AdamW-fused":
+        input_optimizer = torch.optim.AdamW([prompt_embeds], lr=lr, weight_decay=weight_decay, fused=True)
     elif optimizer == "Lion":
         input_optimizer = Lion([prompt_embeds], lr=lr, betas=(0.9, 0.99), weight_decay=weight_decay)
     elif optimizer == "SGD":
         input_optimizer = torch.optim.SGD([prompt_embeds], lr=lr, momentum=0.9)
     elif optimizer == "Adafactor":
-        input_optimizer = Adafactor([prompt_embeds], lr=lr, relative_step=False)
-    else:
+        try:
+            input_optimizer = Adafactor([prompt_embeds], lr=lr, relative_step=False)
+        except:
+            pass
+    if input_optimizer is None:
         raise ValueError(f"Unknown optimizer: {optimizer}")
 
     best_sim = 0
     best_text = ""
     
+    interrupted = False
+    embedding_matrix_normalized = torch.nn.functional.normalize(token_embedding.weight, p=2, dim=1)
     for step in range(opt_iters):
         if shared.state.interrupted:
             break
         if not on_progress is None:
             for progress_step in progress_steps:
                 if step % progress_step == 0:
-                    on_progress(step, opt_iters, best_text, progress_args)
+                    res = on_progress(step, opt_iters, best_text, progress_args)
+                    if res == False:
+                        interrupted = True
                     break
+        if interrupted:
+            break
     
         # randomly sample sample images and get features
         if batch_size is None:
@@ -477,11 +498,13 @@ def optimize_prompt_loop(
             
         universal_target_features = all_target_features
 
-        # forward projection
-        projected_embeds, nn_indices = nn_project(prompt_embeds, token_embedding, print_hits=False)
-
-        # get cosine similarity score with all target features
         with torch.no_grad():
+            # forward projection
+            nn_indices = nn_project(prompt_embeds, embedding_matrix_normalized)
+            #nn_indices = nn_indices.clone() # for compiled nn_project
+            projected_embeds = token_embedding(nn_indices)
+
+            # get cosine similarity score with all target features
             padded_embeds = dummy_embeds.detach().clone()
             padded_embeds[dummy_ids == -1] = projected_embeds.reshape(-1, p_dim)
             logits_per_image, _ = forward_text_embedding(model, padded_embeds, dummy_ids, universal_target_features)
